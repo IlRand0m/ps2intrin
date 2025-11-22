@@ -58,15 +58,27 @@ There is also a minimal CMakeLists.txt provided for integration into CMake proje
 - POR : Parallel Or
 - PXOR : Parallel Exclusive Or
 - PNOR : Parallel Not Or
+- PCEQB : Parallel Compare for Equal Byte
+- PCEQH : Parallel Compare for Equal Halfword
+- PCEQW : Parallel Compare for Equal Word
+- PCGTB : Parallel Compare for Greater Than Byte
+- PCGTH : Parallel Compare for Greater Than Halfword
+- PCGTW : Parallel Compare for Greater Than Word
 - PSLLH : Parallel Shift Left Logical Halfword
-- PSLLVW : Parallel Shift Left Logical Variable Word
 - PSLLW : Parallel Shift Left Logical Word
+- PSLLVW : Parallel Shift Left Logical Variable Word
 - PSRAH : Parallel Shift Right Arithmetic Halfword
-- PSRAVW : Parallel Shift Right Arithmetic Variable Word
 - PSRAW : Parallel Shift Right Arithmetic Word
+- PSRAVW : Parallel Shift Right Arithmetic Variable Word
 - PSRLH : Parallel Shift Right Logical Halfword
-- PSRLVW : Parallel Shift Right Logical Variable Word
 - PSRLW : Parallel Shift Right Logical Word
+- PSRLVW : Parallel Shift Right Logical Variable Word
+- PABSH : Parallel Absolute Halfword
+- PABSW : Parallel Absolute Word
+- PMAXH : Parallel Maximum Halfword
+- PMAXW : Parallel Maximum Word
+- PMINH : Parallel Minimum Halfword
+- PMINW : Parallel Minimum Word
 - PADDB : Parallel Add Byte
 - PADDH : Parallel Add Halfword
 - PADDW : Parallel Add Word
@@ -98,18 +110,6 @@ There is also a minimal CMakeLists.txt provided for integration into CMake proje
 - PDIVW : Parallel Divide Word
 - PDIVBW : Parallel Divide Broadcast Word
 - PDIVUW : Parallel Divide Unsigned Word
-- PABSH : Parallel Absolute Halfword
-- PABSW : Parallel Absolute Word
-- PMAXH : Parallel Maximum Halfword
-- PMAXW : Parallel Maximum Word
-- PMINH : Parallel Minimum Halfword
-- PMINW : Parallel Minimum Word
-- PCEQB : Parallel Compare for Equal Byte
-- PCEQH : Parallel Compare for Equal Halfword
-- PCEQW : Parallel Compare for Equal Word
-- PCGTB : Parallel Compare for Greater Than Byte
-- PCGTH : Parallel Compare for Greater Than Halfword
-- PCGTW : Parallel Compare for Greater Than Word
 - PCPYH : Parallel Copy Halfword
 - PCPYLD : Parallel Copy Lower Doubleword
 - PCPYUD : Parallel Copy Upper Doubleword
