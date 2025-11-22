@@ -35,10 +35,10 @@ There is also a minimal CMakeLists.txt provided for integration into CMake proje
 - MULTU : Multiply unsigned word
 - MULT1 : Multiply word pipeline 1
 - MULTU1 : Multiply unsigned word pipeline 1
-- MADD : Multiply - Add word
-- MADDU : Multiply - Add unsigned word
-- MADD1 : Multiply - Add word pipeline 1
-- MADDU1 : Multiply - Add unsigned word pipeline 1
+- MADD : Multiply-Add word
+- MADDU : Multiply-Add unsigned word
+- MADD1 : Multiply-Add word pipeline 1
+- MADDU1 : Multiply-Add unsigned word pipeline 1
 - DIV : Divide word
 - DIVU : Divide unsigned word
 - DIV1 : Divide word pipeline 1
