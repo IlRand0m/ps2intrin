@@ -117,21 +117,21 @@ There is also a minimal CMakeLists.txt provided for integration into CMake proje
 - PEXCW : Parallel Exchange Center Word
 - PEXEH : Parallel Exchange Even Halfword
 - PEXEW : Parallel Exchange Even Word
-- PEXT5 : Parallel Extent from 5 bits
-- PEXTLB : Parallel Extent Lower from Byte
-- PEXTLH : Parallel Extent Lower from Halfword
-- PEXTLW : Parallel Extent Lower from Word
-- PEXTUB : Parallel Extent Upper from Byte
-- PEXTUH : Parallel Extent Upper from Halfword
-- PEXTUW : Parallel Extent Upper from Word
+- PREVH : Parallel Reverse Halfword
+- PROT3W : Parallel Rotate 3 Words Left
+- PEXTLB : Parallel Extend Lower from Byte
+- PEXTLH : Parallel Extend Lower from Halfword
+- PEXTLW : Parallel Extend Lower from Word
+- PEXTUB : Parallel Extend Upper from Byte
+- PEXTUH : Parallel Extend Upper from Halfword
+- PEXTUW : Parallel Extend Upper from Word
 - PINTEH : Parallel Interleave Even Halfword
 - PINTH : Parallel Interleave Halfword
-- PPAC5 : Parallel Pack to 5 bits
 - PPACB : Parallel Pack to Byte
 - PPACH : Parallel Pack to Halfword
 - PPACW : Parallel Pack to Word
-- PREVH : Parallel Reverse Word
-- PROT3W : Parallel Rotate 3 Words Left
+- PEXT5 : Parallel Extend from 5 bits
+- PPAC5 : Parallel Pack to 5 bits
 - PLZCW : Parallel Leading Zero or One Count Word
 
   ---

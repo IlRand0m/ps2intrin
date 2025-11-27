@@ -32,8 +32,7 @@
 #define UNSEQUENCED __declspec(noalias)
 #define PURE __declspec(noalias)
 #define REPRODUCIBLE __declspec(noalias)
-#define ALIGNAS(x) __declspec(align(x))
-#define ALIGNVECTOR(x) __declspec(align(x))
+#define DECLAREVECTOR(base, name) typedef __declspec(align(16)) base name [16 / sizeof( base )]
 #define MODE_TI
 #elif defined(__GNUC__)
 // Always inline this function into the caller. Must be both
@@ -49,10 +48,8 @@
 // This function only reads arguments, global state, returns a value and reads or writes memory
 // through pointers in function arguments.
 #define REPRODUCIBLE __attribute__ ((reproducible))
-// Alignment specifier used for vector types. I'd use C++ 'alignas' specifier for this, but this
-// header also needs to work in C.
-#define ALIGNAS(x) __attribute__ ((aligned(x)))
-#define ALIGNVECTOR(x) __attribute__ ((vector_size(x), aligned(x)))
+// Declare a 16-byte vector type of base type 'base' and name 'name' with 16-byte alignment.
+#define DECLAREVECTOR(base, name) typedef base __attribute__ ((vector_size(16), aligned(16))) name
 // Integer size of 128 bits specifier
 #define MODE_TI __attribute__((mode(TI)))
 #else
@@ -62,10 +59,10 @@
 #define UNSEQUENCED
 #define PURE
 #define REPRODUCIBLE
-#define ALIGNAS(x)
-#define ALIGNVECTOR(x)
+#define DECLAREVECTOR(base, name) typedef base name [16 / sizeof( base )]
 #define MODE_TI
 #endif
+
 
 #ifdef __cplusplus
 extern "C" {
@@ -107,50 +104,32 @@ extern "C" {
 	/// @brief A 128-bit value containing 16 signed 8-bit values.
 	/// Loads and stores of this type must be aligned 16 to bytes. Otherwise a different memory
 	/// address is fetched/written.
-	typedef struct
-	{
-		int8_t v[16];
-	} ALIGNAS(16) m128i8;
+	DECLAREVECTOR(int8_t, m128i8);
 
 	/// @brief A 128-bit value containing 16 unsigned 8-bit values.
 	/// Loads and stores of this type must be aligned 16 to bytes. Otherwise a different memory
 	/// address is fetched/written.
-	typedef struct
-	{
-		uint8_t v[16];
-	} ALIGNAS(16) m128u8;
+	DECLAREVECTOR(uint8_t, m128u8);
 
 	/// @brief A 128-bit value containing 8 signed 16-bit values.
 	/// Loads and stores of this type must be aligned 16 to bytes. Otherwise a different memory
 	/// address is fetched/written.
-	typedef struct
-	{
-		int16_t v[8];
-	} ALIGNAS(16) m128i16;
+	DECLAREVECTOR(int16_t, m128i16);
 
 	/// @brief A 128-bit value containing 8 unsigned 16-bit values.
 	/// Loads and stores of this type must be aligned 16 to bytes. Otherwise a different memory
 	/// address is fetched/written.
-	typedef struct
-	{
-		uint16_t v[8];
-	} ALIGNAS(16) m128u16;
+	DECLAREVECTOR(uint16_t, m128u16);
 
 	/// @brief A 128-bit value containing 4 signed 32-bit values.
 	/// Loads and stores of this type must be aligned 16 to bytes. Otherwise a different memory
 	/// address is fetched/written.
-	typedef struct
-	{
-		int32_t v[4];
-	} ALIGNAS(16) m128i32;
+	DECLAREVECTOR(int32_t, m128i32);
 
 	/// @brief A 128-bit value containing 4 unsigned 32-bit values.
 	/// Loads and stores of this type must be aligned 16 to bytes. Otherwise a different memory
 	/// address is fetched/written.
-	typedef struct
-	{
-		uint32_t v[4];
-	} ALIGNAS(16) m128u32;
+	DECLAREVECTOR(uint32_t, m128u32);
 
 	/// @brief A 128-bit value containing 2 signed 64-bit values.
 	/// Loads and stores of this type must be aligned 16 to bytes. Otherwise a different memory
@@ -159,10 +138,7 @@ extern "C" {
 	/// Note: Some functions operate on these values. However, often the EE Core hardware
 	/// actually operates on 32-bit values with the upper 32 bits being sign-extension. This is
 	/// also noted on the specific functions this applies to.
-	typedef struct
-	{
-		int64_t v[2];
-	} ALIGNAS(16) m128i64;
+	DECLAREVECTOR(int64_t, m128i64);
 
 	/// @brief A 128-bit value containing 2 unsigned 64-bit values.
 	/// Loads and stores of this type must be aligned 16 to bytes. Otherwise a different memory
@@ -171,10 +147,7 @@ extern "C" {
 	/// Note: Some functions operate on these values. However, often the EE Core hardware
 	/// actually operates on 32-bit values with the upper 32 bits being sign-extension. This is
 	/// also noted on the specific functions this applies to.
-	typedef struct
-	{
-		uint64_t v[2];
-	} ALIGNAS(16) m128u64;
+	DECLAREVECTOR(uint64_t, m128u64);
 
 	/// @brief A 128-bit value containing 1 signed 128-bit value.
 	/// Loads and stores of this type must be aligned 16 to bytes. Otherwise a different memory
@@ -182,10 +155,7 @@ extern "C" {
 	/// 
 	/// Note that 'int128_t' can be assigned using a 'qword_t' from <tamtypes.h>. Use this if you
 	/// already have a 'qword_t' you want to use, plus a cast.
-	typedef struct
-	{
-		int128_t v[1];
-	} ALIGNAS(16) m128i128;
+	DECLAREVECTOR(int128_t, m128i128);
 
 	/// @brief A 128-bit value containing 1 unsigned 128-bit value.
 	/// Loads and stores of this type must be aligned 16 to bytes. Otherwise a different memory
@@ -193,10 +163,7 @@ extern "C" {
 	/// 
 	/// Note that 'uint128_t' can be assigned using a 'qword_t' from <tamtypes.h>. Use this if
 	/// you already have a 'qword_t' you want to use, plus a cast.
-	typedef struct
-	{
-		uint128_t v[1];
-	} ALIGNAS(16) m128u128;
+	DECLAREVECTOR(uint128_t, m128u128);
 
 
 	// General Purpose
@@ -543,11 +510,11 @@ extern "C" {
 	/// 
 	/// This function reads global state (LO1/HI1)
 	/// @return Concatenated LO and HI register values
-	FORCEINLINE PURE int64_t load_lohi0_32()
+	FORCEINLINE PURE int64_t load_lohi1_32()
 	{
-		int64_t result = load_hi0_32();
+		int64_t result = load_hi1_32();
 		result <<= 32;
-		result |= load_lo0_32();
+		result |= load_lo1_32();
 		return result;
 	}
 
@@ -1668,8 +1635,9 @@ extern "C" {
 	/// @param divisor Number to divide by
 	FORCEINLINE void divrem0_i32_start(int32_t dividend, int32_t divisor)
 	{
+		// this needs an extra destination $0 register due to a quirk in the compiler
 		asm volatile(
-			"div %[Dividend],%[Divisor]"							// 
+			"div $0,%[Dividend],%[Divisor]"							// 
 			:														// output operands
 			: [Dividend] "r" (dividend), [Divisor] "r" (divisor)	// input operands
 		);
@@ -1756,8 +1724,9 @@ extern "C" {
 	/// @param divisor Number to divide by
 	FORCEINLINE void divrem0_u32_start(uint32_t dividend, uint32_t divisor)
 	{
+		// this needs an extra destination $0 register due to a quirk in the compiler
 		asm volatile(
-			"divu %[Dividend],%[Divisor]"							// 
+			"divu $0,%[Dividend],%[Divisor]"						// 
 			:														// output operands
 			: [Dividend] "r" (dividend), [Divisor] "r" (divisor)	// input operands
 		);
@@ -1844,8 +1813,9 @@ extern "C" {
 	/// @param divisor Number to divide by
 	FORCEINLINE void divrem1_i32_start(int32_t dividend, int32_t divisor)
 	{
+		// this needs an extra destination $0 register due to a quirk in the compiler
 		asm volatile(
-			"div1 %[Dividend],%[Divisor]"							// 
+			"div1 $0,%[Dividend],%[Divisor]"						// 
 			:														// output operands
 			: [Dividend] "r" (dividend), [Divisor] "r" (divisor)	// input operands
 		);
@@ -1893,7 +1863,7 @@ extern "C" {
 	/// @param dividend Number to divide
 	/// @param divisor Number to divide by
 	/// @return struct containing quotient and remainder of division.
-	FORCEINLINE divrem_i32_result_t div1_i32(int32_t dividend, int32_t divisor)
+	FORCEINLINE divrem_i32_result_t divrem1_i32(int32_t dividend, int32_t divisor)
 	{
 		divrem1_i32_start(dividend, divisor);
 		return divrem1_i32_finish();
@@ -1932,8 +1902,9 @@ extern "C" {
 	/// @param divisor Number to divide by
 	FORCEINLINE void divrem1_u32_start(uint32_t dividend, uint32_t divisor)
 	{
+		// this needs an extra destination $0 register due to a quirk in the compiler
 		asm volatile(
-			"divu1 %[Dividend],%[Divisor]"							// 
+			"divu1 $0,%[Dividend],%[Divisor]"						// 
 			:														// output operands
 			: [Dividend] "r" (dividend), [Divisor] "r" (divisor)	// input operands
 		);
@@ -1971,7 +1942,7 @@ extern "C" {
 	/// @param dividend Number to divide
 	/// @param divisor Number to divide by
 	/// @return struct containing quotient and remainder of division.
-	FORCEINLINE divrem_u32_result_t div1_u32(uint32_t dividend, uint32_t divisor)
+	FORCEINLINE divrem_u32_result_t divrem1_u32(uint32_t dividend, uint32_t divisor)
 	{
 		divrem1_u32_start(dividend, divisor);
 		return divrem1_u32_finish();
@@ -2536,22 +2507,22 @@ extern "C" {
 	{
 		m128i8 result;
 
-		result.v[0] = r15;
-		result.v[1] = r14;
-		result.v[2] = r13;
-		result.v[3] = r12;
-		result.v[4] = r11;
-		result.v[5] = r10;
-		result.v[6] = r9;
-		result.v[7] = r8;
-		result.v[8] = r7;
-		result.v[9] = r6;
-		result.v[10] = r5;
-		result.v[11] = r4;
-		result.v[12] = r3;
-		result.v[13] = r2;
-		result.v[14] = r1;
-		result.v[15] = r0;
+		result[0] = r15;
+		result[1] = r14;
+		result[2] = r13;
+		result[3] = r12;
+		result[4] = r11;
+		result[5] = r10;
+		result[6] = r9;
+		result[7] = r8;
+		result[8] = r7;
+		result[9] = r6;
+		result[10] = r5;
+		result[11] = r4;
+		result[12] = r3;
+		result[13] = r2;
+		result[14] = r1;
+		result[15] = r0;
 
 		return result;
 	}
@@ -2589,22 +2560,22 @@ extern "C" {
 	{
 		m128u8 result;
 
-		result.v[0] = r15;
-		result.v[1] = r14;
-		result.v[2] = r13;
-		result.v[3] = r12;
-		result.v[4] = r11;
-		result.v[5] = r10;
-		result.v[6] = r9;
-		result.v[7] = r8;
-		result.v[8] = r7;
-		result.v[9] = r6;
-		result.v[10] = r5;
-		result.v[11] = r4;
-		result.v[12] = r3;
-		result.v[13] = r2;
-		result.v[14] = r1;
-		result.v[15] = r0;
+		result[0] = r15;
+		result[1] = r14;
+		result[2] = r13;
+		result[3] = r12;
+		result[4] = r11;
+		result[5] = r10;
+		result[6] = r9;
+		result[7] = r8;
+		result[8] = r7;
+		result[9] = r6;
+		result[10] = r5;
+		result[11] = r4;
+		result[12] = r3;
+		result[13] = r2;
+		result[14] = r1;
+		result[15] = r0;
 
 		return result;
 	}
@@ -2633,14 +2604,14 @@ extern "C" {
 	{
 		m128i16 result;
 
-		result.v[0] = r7;
-		result.v[1] = r6;
-		result.v[2] = r5;
-		result.v[3] = r4;
-		result.v[4] = r3;
-		result.v[5] = r2;
-		result.v[6] = r1;
-		result.v[7] = r0;
+		result[0] = r7;
+		result[1] = r6;
+		result[2] = r5;
+		result[3] = r4;
+		result[4] = r3;
+		result[5] = r2;
+		result[6] = r1;
+		result[7] = r0;
 
 		return result;
 	}
@@ -2669,14 +2640,14 @@ extern "C" {
 	{
 		m128u16 result;
 
-		result.v[0] = r7;
-		result.v[1] = r6;
-		result.v[2] = r5;
-		result.v[3] = r4;
-		result.v[4] = r3;
-		result.v[5] = r2;
-		result.v[6] = r1;
-		result.v[7] = r0;
+		result[0] = r7;
+		result[1] = r6;
+		result[2] = r5;
+		result[3] = r4;
+		result[4] = r3;
+		result[5] = r2;
+		result[6] = r1;
+		result[7] = r0;
 
 		return result;
 	}
@@ -2701,10 +2672,10 @@ extern "C" {
 	{
 		m128i32 result;
 
-		result.v[0] = r3;
-		result.v[1] = r2;
-		result.v[2] = r1;
-		result.v[3] = r0;
+		result[0] = r3;
+		result[1] = r2;
+		result[2] = r1;
+		result[3] = r0;
 
 		return result;
 	}
@@ -2729,10 +2700,10 @@ extern "C" {
 	{
 		m128u32 result;
 
-		result.v[0] = r3;
-		result.v[1] = r2;
-		result.v[2] = r1;
-		result.v[3] = r0;
+		result[0] = r3;
+		result[1] = r2;
+		result[2] = r1;
+		result[3] = r0;
 
 		return result;
 	}
@@ -2755,8 +2726,8 @@ extern "C" {
 	{
 		m128i64 result;
 
-		result.v[0] = r1;
-		result.v[1] = r0;
+		result[0] = r1;
+		result[1] = r0;
 
 		return result;
 	}
@@ -2779,8 +2750,8 @@ extern "C" {
 	{
 		m128u64 result;
 
-		result.v[0] = r1;
-		result.v[1] = r0;
+		result[0] = r1;
+		result[1] = r0;
 
 		return result;
 	}
@@ -3408,7 +3379,7 @@ extern "C" {
 	/// 
 	/// Store 1 unsigned 128-bit value to the LO register.
 	/// @param v Value to store to LO
-	FORCEINLINE void mm_storelo_epu64(m128u64 v)
+	FORCEINLINE void mm_storelo_epu128(m128u128 v)
 	{
 		// volatile for same reason as store_lo*
 		asm volatile(
@@ -4928,7 +4899,7 @@ extern "C" {
 	/// @param result Variable identifier to store result to. Must be of type 'm128u32'
 	/// @param value Variable identifier to use as source value. Must be of type 'm128u32'
 	/// @param shift_value Amount of bits to shift the source value left. Must be in range [0, 31]
-#define PSRAW(result, value, shift_amount)															\
+#define PSRLW(result, value, shift_amount)															\
 		asm(																						\
 			"psrlw %[Result],%[Value],%c[ShiftAmount]"												\
 			: [Result] "=r" (result)																\
@@ -5819,31 +5790,6 @@ extern "C" {
 		return result;
 	}
 
-	/// @brief PMADDUW : Parallel Multiply-ADD Unsigned Word
-	/// 
-	/// Works exactly as 'mm_fma_epu64' but subtracts the product from the accumulators instead.
-	/// 
-	/// Multiplication happens asynchronously. Reading from the return value, the LO or the HI
-	/// register will stall the EE Core until the result is ready.
-	/// 
-	/// This function writes to global state (LO/HI).
-	/// @param l First operand
-	/// @param r Second operand
-	/// @return Multiply-accumulate result containing full 64-bit unsigned values
-	FORCEINLINE m128u64 mm_fms_epu64(m128u64 l, m128u64 r)
-	{
-		m128u64 result;
-
-		// volatile because writes to LO/HI
-		asm volatile(
-			"pmsubuw %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
-	}
-
 
 	/// @brief PDIVW : Parallel DIVide Word
 	/// 
@@ -5918,6 +5864,1063 @@ extern "C" {
 		);
 	}
 
+
+	/// @brief PCPYH : Parallel CoPY Halfword
+	/// 
+	/// Out of the 8 16-bit values in the input value select those at position 0 and 4. Broadcast
+	/// the value at position 0 to positions 0, 1, 2 and 3; and the value at position 4 to
+	/// positions 4, 5, 6, and 7 of the return value.
+	/// @param v Value to broadcast from
+	/// @return Broadcasted values
+	FORCEINLINE CONST m128i16 mm_broadcast2_epi16(m128i16 v)
+	{
+		m128i16 result;
+
+		asm(
+			"pcpyh %[Result],%[Value]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
+	/// @brief PCPYH : Parallel CoPY Halfword
+	/// 
+	/// Out of the 8 16-bit values in the input value select those at position 0 and 4. Broadcast
+	/// the value at position 0 to positions 0, 1, 2 and 3; and the value at position 4 to
+	/// positions 4, 5, 6, and 7 of the return value.
+	/// @param v Value to broadcast from
+	/// @return Broadcasted values
+	FORCEINLINE CONST m128u16 mm_broadcast2_epu16(m128u16 v)
+	{
+		m128u16 result;
+
+		asm(
+			"pcpyh %[Result],%[Value]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
+	/// @brief PCPYLD : Parallel CoPY Lower Doubleword
+	/// 
+	/// Select the lower 64 bits of each input value and combine them into a 128-bit value.
+	/// @param lower Value to put in the low 64 bits of the return value
+	/// @param upper Value to put in the high 64 bits of the return value
+	/// @return Combined values
+	FORCEINLINE CONST m128i64 mm_unpacklo_epi64(m128i64 lower, m128i64 upper)
+	{
+		m128i64 result;
+
+		asm(
+			"pcpyld %[Result],%[Upper],%[Lower]"
+			: [Result] "=r" (result)
+			: [Upper] "r" (upper), [Lower] "r" (lower)
+		);
+
+		return result;
+	}
+
+	/// @brief PCPYLD : Parallel CoPY Lower Doubleword
+	/// 
+	/// Select the lower 64 bits of each input value and combine them into a 128-bit value.
+	/// @param lower Value to put in the low 64 bits of the return value
+	/// @param upper Value to put in the high 64 bits of the return value
+	/// @return Combined values
+	FORCEINLINE CONST m128u64 mm_unpacklo_epu64(m128u64 lower, m128u64 upper)
+	{
+		m128u64 result;
+
+		asm(
+			"pcpyld %[Result],%[Upper],%[Lower]"
+			: [Result] "=r" (result)
+			: [Upper] "r" (upper), [Lower] "r" (lower)
+		);
+
+		return result;
+	}
+
+	/// @brief PCPYUD : Parallel CoPY Upper Doubleword
+	/// 
+	/// Select the high 64 bits of each input value and combine them into a 128-bit value.
+	/// @param lower Value to put in the low 64 bits of the return value
+	/// @param upper Value to put in the high 64 bits of the return value
+	/// @return Combined values
+	FORCEINLINE CONST m128i64 mm_unpackhi_epi64(m128i64 lower, m128i64 upper)
+	{
+		m128i64 result;
+
+		asm(
+			"pcpyud %[Result],%[Lower],%[Upper]"
+			: [Result] "=r" (result)
+			: [Upper] "r" (upper), [Lower] "r" (lower)
+		);
+
+		return result;
+	}
+
+	/// @brief PCPYUD : Parallel CoPY Upper Doubleword
+	/// 
+	/// Select the high 64 bits of each input value and combine them into a 128-bit value.
+	/// @param lower Value to put in the low 64 bits of the return value
+	/// @param upper Value to put in the high 64 bits of the return value
+	/// @return Combined values
+	FORCEINLINE CONST m128u64 mm_unpackhi_epu64(m128u64 lower, m128u64 upper)
+	{
+		m128u64 result;
+
+		asm(
+			"pcpyud %[Result],%[Lower],%[Upper]"
+			: [Result] "=r" (result)
+			: [Upper] "r" (upper), [Lower] "r" (lower)
+		);
+
+		return result;
+	}
+
+	/// @brief PEXCH : Parallel EXchange Center Halfword
+	/// 
+	/// Split the 8 16-bit values into 2 groups of 4. The low group spans values at porition 0,
+	/// 1, 2 and 3. The upper group spans 4, 5, 6 and 7. Exchange values in the center of each
+	/// group. 1 will swap with 2 and 5 will swap with 6.
+	/// @param v Values to exchange values in
+	/// @return Values after exchanging center values
+	FORCEINLINE CONST m128i16 mm_xchgcenter_epi16(m128i16 v)
+	{
+		m128i16 result;
+
+		asm(
+			"pexch %[Result],%[Value]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
+	/// @brief PEXCH : Parallel EXchange Center Halfword
+	/// 
+	/// Split the 8 16-bit values into 2 groups of 4. The low group spans values at porition 0,
+	/// 1, 2 and 3. The upper group spans 4, 5, 6 and 7. Exchange values in the center of each
+	/// group. 1 will swap with 2 and 5 will swap with 6.
+	/// @param v Values to exchange values in
+	/// @return Values after exchanging center values
+	FORCEINLINE CONST m128u16 mm_xchgcenter_epu16(m128u16 v)
+	{
+		m128u16 result;
+
+		asm(
+			"pexch %[Result],%[Value]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
+	/// @brief PEXCW : Parallel EXchange Center Word
+	/// 
+	/// Take 4 32-bit values. Swap the central 2 values.
+	/// @param v Value to exchange elements in
+	/// @return Value after exchanging elements
+	FORCEINLINE CONST m128i32 mm_xchgcenter_epi32(m128i32 v)
+	{
+		m128i32 result;
+
+		asm(
+			"pexcw %[Result],%[Value]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
+	/// @brief PEXCW : Parallel EXchange Center Word
+	/// 
+	/// Take 4 32-bit values. Swap the central 2 values.
+	/// @param v Value to exchange elements in
+	/// @return Value after exchanging elements
+	FORCEINLINE CONST m128u32 mm_xchgcenter_epu32(m128u32 v)
+	{
+		m128u32 result;
+
+		asm(
+			"pexew %[Result],%[Value]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
+	/// @brief PEXEH : Parallel EXchange Even Halfword
+	/// 
+	/// Split the 8 16-bit values into 2 groups of 4. The low group spans values at porition 0,
+	/// 1, 2 and 3. The upper group spans 4, 5, 6 and 7. Exchange values in even positions of each
+	/// group. 0 will swap with 2 and 4 will swap with 6.
+	/// @param v Values to exchange values in
+	/// @return Values after exchanging center values
+	FORCEINLINE CONST m128i16 mm_xchgeven_epi16(m128i16 v)
+	{
+		m128i16 result;
+
+		asm(
+			"pexeh %[Result],%[Value]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
+	/// @brief PEXEH : Parallel EXchange Even Halfword
+	/// 
+	/// Split the 8 16-bit values into 2 groups of 4. The low group spans values at porition 0,
+	/// 1, 2 and 3. The upper group spans 4, 5, 6 and 7. Exchange values in even positions of each
+	/// group. 0 will swap with 2 and 4 will swap with 6.
+	/// @param v Values to exchange values in
+	/// @return Values after exchanging center values
+	FORCEINLINE CONST m128u16 mm_xchgeven_epu16(m128u16 v)
+	{
+		m128u16 result;
+
+		asm(
+			"pexeh %[Result],%[Value]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
+	/// @brief PEXEW : Parallel EXchange Even Word
+	/// 
+	/// Take 4 32-bit values. Swap the values in even positions, 0 and 2.
+	/// @param v Value to exchange elements in
+	/// @return Value after exchanging elements
+	FORCEINLINE CONST m128i32 mm_xchgeven_epi32(m128i32 v)
+	{
+		m128i32 result;
+
+		asm(
+			"pexew %[Result],%[Value]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
+	/// @brief PEXEW : Parallel EXchange Even Word
+	/// 
+	/// Take 4 32-bit values. Swap the values in even positions, 0 and 2.
+	/// @param v Value to exchange elements in
+	/// @return Value after exchanging elements
+	FORCEINLINE CONST m128u32 mm_xchgeven_epu32(m128u32 v)
+	{
+		m128u32 result;
+
+		asm(
+			"pexew %[Result],%[Value]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
+	/// @brief PREVH : Parallel REVerse Halfword
+	/// 
+	/// Split the 8 16-bit values into 2 groups of 4. The low group spans values at porition 0,
+	/// 1, 2 and 3. The upper group spans 4, 5, 6 and 7. Reverse the order within each group. The
+	/// total order of the return value is: 3, 2, 1, 0, 7, 6, 5, 4.
+	/// @param v Value to reverse elements in
+	/// @return Value after reversing elements
+	FORCEINLINE CONST m128i16 mm_reverse_epi16(m128i16 v)
+	{
+		m128i16 result;
+
+		asm(
+			"prevh %[Result],%[Value]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
+	/// @brief PREVH : Parallel REVerse Halfword
+	/// 
+	/// Split the 8 16-bit values into 2 groups of 4. The low group spans values at porition 0,
+	/// 1, 2 and 3. The upper group spans 4, 5, 6 and 7. Reverse the order within each group. The
+	/// total order of the return value is: 3, 2, 1, 0, 7, 6, 5, 4.
+	/// @param v Value to reverse elements in
+	/// @return Value after reversing elements
+	FORCEINLINE CONST m128u16 mm_reverse_epu16(m128u16 v)
+	{
+		m128u16 result;
+
+		asm(
+			"prevh %[Result],%[Value]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
+	/// @brief PROT3W: Parallel ROTate 3 Words left
+	/// 
+	/// Select the lower 3 32-bit values from 4. Rotate those 3 words 1 position towards a lower
+	/// position. Values at position 0, 1 and 2 go to location 2, 0 and 1.
+	/// @param v Value to rotate words in
+	/// @return Value after rotating words
+	FORCEINLINE CONST m128i32 mm_rot3_epi32(m128i32 v)
+	{
+		m128i32 result;
+
+		asm(
+			"prot3w %[Result],%[Value]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
+	/// @brief PROT3W: Parallel ROTate 3 Words left
+	/// 
+	/// Select the lower 3 32-bit values from 4. Rotate those 3 words 1 position towards a lower
+	/// position. Values at position 0, 1 and 2 go to location 2, 0 and 1.
+	/// @param v Value to rotate words in
+	/// @return Value after rotating words
+	FORCEINLINE CONST m128u32 mm_rot3_epu32(m128u32 v)
+	{
+		m128u32 result;
+
+		asm(
+			"prot3w %[Result],%[Value]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
+	/// @brief PEXTLB : Parallel EXTend Lower from Byte
+	/// 
+	/// Use only the lower 8 bytes of both operands. Interleave them into the return value such
+	/// that their relative ordering stays intact and the values from 'even' land in the even
+	/// positions and the values from 'odd' land in the odd positions.
+	/// 
+	/// Bitwise result:
+	///		Return value[ 0,  7]	=	even[0,  7]
+	///		Return value[ 8, 15]	=	odd	[0,  7]
+	///		Return value[16, 23]	=	even[8, 15]
+	///		Return value[24, 31]	=	odd	[8, 15]
+	///		...
+	/// @param even Values to put in even positions in the return value
+	/// @param odd Values to put in odd positions in the return value
+	/// @return Interleaved values from both arguments
+	FORCEINLINE CONST m128i8 mm_extlo_epi8(m128i8 even, m128i8 odd)
+	{
+		m128i8 result;
+
+		asm(
+			"pextlb %[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result)
+			: [Even] "r" (even), [Odd] "r" (odd)
+		);
+
+		return result;
+	}
+
+	/// @brief PEXTLB : Parallel EXTend Lower from Byte
+	/// 
+	/// Use only the lower 8 bytes of both operands. Interleave them into the return value such
+	/// that their relative ordering stays intact and the values from 'even' land in the even
+	/// positions and the values from 'odd' land in the odd positions.
+	/// 
+	/// Bitwise result:
+	///		Return value[ 0,  7]	=	even[0,  7]
+	///		Return value[ 8, 15]	=	odd	[0,  7]
+	///		Return value[16, 23]	=	even[8, 15]
+	///		Return value[24, 31]	=	odd	[8, 15]
+	///		...
+	/// @param even Values to put in even positions in the return value
+	/// @param odd Values to put in odd positions in the return value
+	/// @return Interleaved values from both arguments
+	FORCEINLINE CONST m128u8 mm_extlo_epu8(m128u8 even, m128u8 odd)
+	{
+		m128u8 result;
+
+		asm(
+			"pextlb %[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result)
+			: [Even] "r" (even), [Odd] "r" (odd)
+		);
+
+		return result;
+	}
+
+	/// @brief PEXTUB : Parallel EXTend Upper from Byte
+	/// 
+	/// Use only the upper 8 bytes of both operands. Interleave them into the return value such
+	/// that their relative ordering stays intact and the values from 'even' land in the even
+	/// positions and the values from 'odd' land in the odd positions.
+	/// 
+	/// Bitwise result:
+	///		Return value[ 0,  7]	=	even[64, 71]
+	///		Return value[ 8, 15]	=	odd	[64, 71]
+	///		Return value[16, 23]	=	even[72, 79]
+	///		Return value[24, 31]	=	odd	[72, 79]
+	///		...
+	/// @param even Values to put in even positions in the return value
+	/// @param odd Values to put in odd positions in the return value
+	/// @return Interleaved values from both arguments
+	FORCEINLINE CONST m128i8 mm_exthi_epi8(m128i8 even, m128i8 odd)
+	{
+		m128i8 result;
+
+		asm(
+			"pextub %[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result)
+			: [Even] "r" (even), [Odd] "r" (odd)
+		);
+
+		return result;
+	}
+
+	/// @brief PEXTUB : Parallel EXTend Upper from Byte
+	/// 
+	/// Use only the upper 8 bytes of both operands. Interleave them into the return value such
+	/// that their relative ordering stays intact and the values from 'even' land in the even
+	/// positions and the values from 'odd' land in the odd positions.
+	/// 
+	/// Bitwise result:
+	///		Return value[ 0,  7]	=	even[64, 71]
+	///		Return value[ 8, 15]	=	odd	[64, 71]
+	///		Return value[16, 23]	=	even[72, 79]
+	///		Return value[24, 31]	=	odd	[72, 79]
+	///		...
+	/// @param even Values to put in even positions in the return value
+	/// @param odd Values to put in odd positions in the return value
+	/// @return Interleaved values from both arguments
+	FORCEINLINE CONST m128u8 mm_exthi_epu8(m128u8 even, m128u8 odd)
+	{
+		m128u8 result;
+
+		asm(
+			"pextub %[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result)
+			: [Even] "r" (even), [Odd] "r" (odd)
+		);
+
+		return result;
+	}
+
+	/// @brief PEXTLH : Parallel EXTend Lower from Halfword
+	/// 
+	/// Use only the lower 4 halfwords of both operands. Interleave them into the return value
+	/// such that their relative ordering stays intact and the values from 'even' land in the even
+	/// positions and the values from 'odd' land in the odd positions.
+	/// 
+	/// Bitwise result:
+	///		Return value[ 0, 15]	=	even[ 0, 15]
+	///		Return value[16, 31]	=	odd	[ 0, 15]
+	///		Return value[32, 47]	=	even[16, 31]
+	///		Return value[48, 63]	=	odd	[16, 31]
+	///		...
+	/// @param even Values to put in even positions in the return value
+	/// @param odd Values to put in odd positions in the return value
+	/// @return Interleaved values from both arguments
+	FORCEINLINE CONST m128i16 mm_extlo_epi16(m128i16 even, m128i16 odd)
+	{
+		m128i16 result;
+
+		asm(
+			"pextlh %[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result)
+			: [Even] "r" (even), [Odd] "r" (odd)
+		);
+
+		return result;
+	}
+
+	/// @brief PEXTLH : Parallel EXTend Lower from Halfword
+	/// 
+	/// Use only the lower 4 halfwords of both operands. Interleave them into the return value
+	/// such that their relative ordering stays intact and the values from 'even' land in the even
+	/// positions and the values from 'odd' land in the odd positions.
+	/// 
+	/// Bitwise result:
+	///		Return value[ 0, 15]	=	even[ 0, 15]
+	///		Return value[16, 31]	=	odd	[ 0, 15]
+	///		Return value[32, 47]	=	even[16, 31]
+	///		Return value[48, 63]	=	odd	[16, 31]
+	///		...
+	/// @param even Values to put in even positions in the return value
+	/// @param odd Values to put in odd positions in the return value
+	/// @return Interleaved values from both arguments
+	FORCEINLINE CONST m128u16 mm_extlo_epu16(m128u16 even, m128u16 odd)
+	{
+		m128u16 result;
+
+		asm(
+			"pextlh %[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result)
+			: [Even] "r" (even), [Odd] "r" (odd)
+		);
+
+		return result;
+	}
+
+	/// @brief PEXTUH : Parallel EXTend Upper from Halfword
+	/// 
+	/// Use only the upper 4 halfwords of both operands. Interleave them into the return value
+	/// such that their relative ordering stays intact and the values from 'even' land in the even
+	/// positions and the values from 'odd' land in the odd positions.
+	/// 
+	/// Bitwise result:
+	///		Return value[ 0, 15]	=	even[64, 79]
+	///		Return value[16, 31]	=	odd	[64, 79]
+	///		Return value[32, 47]	=	even[80, 95]
+	///		Return value[48, 63]	=	odd	[80, 95]
+	///		...
+	/// @param even Values to put in even positions in the return value
+	/// @param odd Values to put in odd positions in the return value
+	/// @return Interleaved values from both arguments
+	FORCEINLINE CONST m128i16 mm_exthi_epi16(m128i16 even, m128i16 odd)
+	{
+		m128i16 result;
+
+		asm(
+			"pextuh %[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result)
+			: [Even] "r" (even), [Odd] "r" (odd)
+		);
+
+		return result;
+	}
+
+	/// @brief PEXTUH : Parallel EXTend Upper from Halfword
+	/// 
+	/// Use only the upper 4 halfwords of both operands. Interleave them into the return value
+	/// such that their relative ordering stays intact and the values from 'even' land in the even
+	/// positions and the values from 'odd' land in the odd positions.
+	/// 
+	/// Bitwise result:
+	///		Return value[ 0, 15]	=	even[64, 79]
+	///		Return value[16, 31]	=	odd	[64, 79]
+	///		Return value[32, 47]	=	even[80, 95]
+	///		Return value[48, 63]	=	odd	[80, 95]
+	///		...
+	/// @param even Values to put in even positions in the return value
+	/// @param odd Values to put in odd positions in the return value
+	/// @return Interleaved values from both arguments
+	FORCEINLINE CONST m128u16 mm_exthi_epu16(m128u16 even, m128u16 odd)
+	{
+		m128u16 result;
+
+		asm(
+			"pextuh %[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result)
+			: [Even] "r" (even), [Odd] "r" (odd)
+		);
+
+		return result;
+	}
+
+	/// @brief PEXTLW : Parallel EXTend Lower from Word
+	/// 
+	/// Use only the lower 2 words of both operands. Interleave them into the return value such
+	/// that their relative ordering stays intact and the values from 'even' land in the even
+	/// positions and the values from 'odd' land in the odd positions.
+	/// 
+	/// Bitwise result:
+	///		Return value[ 0,  31]	=	even[ 0, 31]
+	///		Return value[32,  63]	=	odd	[ 0, 31]
+	///		Return value[64,  95]	=	even[32, 63]
+	///		Return value[96, 127]	=	odd	[32, 63]
+	/// @param even Values to put in even positions in the return value
+	/// @param odd Values to put in odd positions in the return value
+	/// @return Interleaved values from both arguments
+	FORCEINLINE CONST m128i32 mm_extlo_epi326(m128i32 even, m128i32 odd)
+	{
+		m128i32 result;
+
+		asm(
+			"pextlw %[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result)
+			: [Even] "r" (even), [Odd] "r" (odd)
+		);
+
+		return result;
+	}
+
+	/// @brief PEXTLW : Parallel EXTend Lower from Word
+	/// 
+	/// Use only the lower 2 words of both operands. Interleave them into the return value such
+	/// that their relative ordering stays intact and the values from 'even' land in the even
+	/// positions and the values from 'odd' land in the odd positions.
+	/// 
+	/// Bitwise result:
+	///		Return value[ 0,  31]	=	even[ 0, 31]
+	///		Return value[32,  63]	=	odd	[ 0, 31]
+	///		Return value[64,  95]	=	even[32, 63]
+	///		Return value[96, 127]	=	odd	[32, 63]
+	/// @param even Values to put in even positions in the return value
+	/// @param odd Values to put in odd positions in the return value
+	/// @return Interleaved values from both arguments
+	FORCEINLINE CONST m128u32 mm_extlo_epu32(m128u32 even, m128u32 odd)
+	{
+		m128u32 result;
+
+		asm(
+			"pextlw %[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result)
+			: [Even] "r" (even), [Odd] "r" (odd)
+		);
+
+		return result;
+	}
+
+	/// @brief PEXTUW : Parallel EXTend Upper from Word
+	/// 
+	/// Use only the upper 2 words of both operands. Interleave them into the return value such
+	/// that their relative ordering stays intact and the values from 'even' land in the even
+	/// positions and the values from 'odd' land in the odd positions.
+	/// 
+	/// Bitwise result:
+	///		Return value[ 0,  31]	=	even[64,  95]
+	///		Return value[32,  63]	=	odd	[64,  95]
+	///		Return value[64,  95]	=	even[96, 127]
+	///		Return value[96, 127]	=	odd	[96, 127]
+	/// @param even Values to put in even positions in the return value
+	/// @param odd Values to put in odd positions in the return value
+	/// @return Interleaved values from both arguments
+	FORCEINLINE CONST m128i32 mm_exthi_epi32(m128i32 even, m128i32 odd)
+	{
+		m128i32 result;
+
+		asm(
+			"pextuw %[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result)
+			: [Even] "r" (even), [Odd] "r" (odd)
+		);
+
+		return result;
+	}
+
+	/// @brief PEXTUW : Parallel EXTend Upper from Word
+	/// 
+	/// Use only the upper 2 words of both operands. Interleave them into the return value such
+	/// that their relative ordering stays intact and the values from 'even' land in the even
+	/// positions and the values from 'odd' land in the odd positions.
+	/// 
+	/// Bitwise result:
+	///		Return value[ 0,  31]	=	even[64,  95]
+	///		Return value[32,  63]	=	odd	[64,  95]
+	///		Return value[64,  95]	=	even[96, 127]
+	///		Return value[96, 127]	=	odd	[96, 127]
+	/// @param even Values to put in even positions in the return value
+	/// @param odd Values to put in odd positions in the return value
+	/// @return Interleaved values from both arguments
+	FORCEINLINE CONST m128u32 mm_exthi_epu32(m128u32 even, m128u32 odd)
+	{
+		m128u32 result;
+
+		asm(
+			"pextuw %[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result)
+			: [Even] "r" (even), [Odd] "r" (odd)
+		);
+
+		return result;
+	}
+
+	/// @brief PINTEH : Parallel INTerleave Even Halfword
+	/// 
+	/// Select only the 4 values in even positions in the input arguments. Interleave the values
+	/// from 'even' in the even positions and those from 'odd' in the odd positions of the return
+	/// value.
+	/// 
+	/// Bitwise result:
+	///		Return value[ 0, 15]	=	even[ 0, 15]
+	///		Return value[16, 31]	=	odd	[ 0, 15]
+	///		Return value[32, 47]	=	even[32, 47]
+	///		Return value[48, 63]	=	odd	[32, 47]
+	///		...
+	/// @param even Values to put in the even positions
+	/// @param odd Values to put in the odd positions
+	/// @return Interleaved values
+	FORCEINLINE CONST m128i16 mm_interleaveeven_epi16(m128i16 even, m128i16 odd)
+	{
+		m128i16 result;
+
+		asm(
+			"pinteh %[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result)
+			: [Odd] "r" (odd), [Even] "r" (even)
+		);
+
+		return result;
+	}
+
+	/// @brief PINTEH : Parallel INTerleave Even Halfword
+	/// 
+	/// Select only the 4 values in even positions in the input arguments. Interleave the values
+	/// from 'even' in the even positions and those from 'odd' in the odd positions of the return
+	/// value.
+	/// 
+	/// Bitwise result:
+	///		Return value[ 0, 15]	=	even[ 0, 15]
+	///		Return value[16, 31]	=	odd	[ 0, 15]
+	///		Return value[32, 47]	=	even[32, 47]
+	///		Return value[48, 63]	=	odd	[32, 47]
+	///		...
+	/// @param even Values to put in the even positions
+	/// @param odd Values to put in the odd positions
+	/// @return Interleaved values
+	FORCEINLINE CONST m128u16 mm_interleaveeven_epu16(m128u16 even, m128u16 odd)
+	{
+		m128u16 result;
+
+		asm(
+			"pinteh %[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result)
+			: [Odd] "r" (odd), [Even] "r" (even)
+		);
+
+		return result;
+	}
+
+	/// @brief PINTH : Parallel INTerleave Halfword
+	/// 
+	/// Select only the low 4 values from 'even' and the high 4 values from 'odd'. Interleave the
+	/// values from 'even' in the even positions and those from 'odd' in the odd positions of the
+	/// return value.
+	/// 
+	/// Bitwise result:
+	///		Return value[ 0, 15]	=	even[ 0, 15]
+	///		Return value[16, 31]	=	odd	[64, 79]
+	///		Return value[32, 47]	=	even[16, 31]
+	///		Return value[48, 63]	=	odd	[80, 95]
+	///		...
+	/// @param even Values to put in the even positions
+	/// @param odd Values to put in the odd positions
+	/// @return Interleaved values
+	FORCEINLINE CONST m128i16 mm_interleavelohi_epi16(m128i16 even, m128i16 odd)
+	{
+		m128i16 result;
+
+		asm(
+			"pinth %[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result)
+			: [Odd] "r" (odd), [Even] "r" (even)
+		);
+
+		return result;
+	}
+
+	/// @brief PINTH : Parallel INTerleave Halfword
+	/// 
+	/// Select only the low 4 values from 'even' and the high 4 values from 'odd'. Interleave the
+	/// values from 'even' in the even positions and those from 'odd' in the odd positions of the
+	/// return value.
+	/// 
+	/// Bitwise result:
+	///		Return value[ 0, 15]	=	even[ 0, 15]
+	///		Return value[16, 31]	=	odd	[64, 79]
+	///		Return value[32, 47]	=	even[16, 31]
+	///		Return value[48, 63]	=	odd	[80, 95]
+	///		...
+	/// @param even Values to put in the even positions
+	/// @param odd Values to put in the odd positions
+	/// @return Interleaved values
+	FORCEINLINE CONST m128u16 mm_interleavelohi_epu16(m128u16 even, m128u16 odd)
+	{
+		m128u16 result;
+
+		asm(
+			"pinth %[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result)
+			: [Odd] "r" (odd), [Even] "r" (even)
+		);
+
+		return result;
+	}
+
+	/// @brief PPACB : Parallel PACk to Byte
+	/// 
+	/// Select only the values in even positions of both arguments. Store the values from 'lo' to
+	/// the low 8 bytes of the return value and the values from 'hi' to the high 8 bytes.
+	/// 
+	/// Bitwise result:
+	///		Return value[ 0,  7]	=	lo[ 0,  7]
+	///		Return value[ 8, 15]	=	lo[16, 23]
+	///		...
+	///		Return value[64, 71]	=	hi[ 0,  7]
+	///		Return value[72, 79]	=	hi[16, 23]
+	/// @param lo Values to put in the low 8 bytes of the return value
+	/// @param hi Values to put in the high 8 bytes of the return value
+	/// @return Packed values of both arguments
+	FORCEINLINE CONST m128i8 mm_pack_epi8(m128i8 lo, m128i8 hi)
+	{
+		m128i8 result;
+
+		asm(
+			"ppacb %[Result],%[Hi],%[Lo]"
+			: [Result] "=r" (result)
+			: [Lo] "r" (lo), [Hi] "r" (hi)
+		);
+
+		return result;
+	}
+
+	/// @brief PPACB : Parallel PACk to Byte
+	/// 
+	/// Select only the values in even positions of both arguments. Store the values from 'lo' to
+	/// the low 8 bytes of the return value and the values from 'hi' to the high 8 bytes.
+	/// 
+	/// Bitwise result:
+	///		Return value[ 0,  7]	=	lo[ 0,  7]
+	///		Return value[ 8, 15]	=	lo[16, 23]
+	///		...
+	///		Return value[64, 71]	=	hi[ 0,  7]
+	///		Return value[72, 79]	=	hi[16, 23]
+	/// @param lo Values to put in the low 8 bytes of the return value
+	/// @param hi Values to put in the high 8 bytes of the return value
+	/// @return Packed values of both arguments
+	FORCEINLINE CONST m128u8 mm_pack_epu8(m128u8 lo, m128u8 hi)
+	{
+		m128u8 result;
+
+		asm(
+			"ppacb %[Result],%[Hi],%[Lo]"
+			: [Result] "=r" (result)
+			: [Lo] "r" (lo), [Hi] "r" (hi)
+		);
+
+		return result;
+	}
+
+	/// @brief PPACH : Parallel PACk to Halfword
+	/// 
+	/// Select only the values in even positions of both arguments. Store the values from 'lo' to
+	/// the low 4 halfwords of the return value and the values from 'hi' to the high 4 halfwords.
+	/// 
+	/// Bitwise result:
+	///		Return value[ 0, 15]	=	lo[ 0, 15]
+	///		Return value[16, 31]	=	lo[32, 47]
+	///		...
+	///		Return value[64, 79]	=	hi[ 0, 15]
+	///		Return value[80, 95]	=	hi[32, 47]
+	/// @param lo Values to put in the low 4 halfwords of the return value
+	/// @param hi Values to put in the high 4 halfwords of the return value
+	/// @return Packed values of both arguments
+	FORCEINLINE CONST m128i16 mm_pack_epi16(m128i16 lo, m128i16 hi)
+	{
+		m128i16 result;
+
+		asm(
+			"ppach %[Result],%[Hi],%[Lo]"
+			: [Result] "=r" (result)
+			: [Lo] "r" (lo), [Hi] "r" (hi)
+		);
+
+		return result;
+	}
+
+	/// @brief PPACH : Parallel PACk to Halfword
+	/// 
+	/// Select only the values in even positions of both arguments. Store the values from 'lo' to
+	/// the low 4 halfwords of the return value and the values from 'hi' to the high 4 halfwords.
+	/// 
+	/// Bitwise result:
+	///		Return value[ 0, 15]	=	lo[ 0, 15]
+	///		Return value[16, 31]	=	lo[32, 47]
+	///		...
+	///		Return value[64, 79]	=	hi[ 0, 15]
+	///		Return value[80, 95]	=	hi[32, 47]
+	/// @param lo Values to put in the low 4 halfwords of the return value
+	/// @param hi Values to put in the high 4 halfwords of the return value
+	/// @return Packed values of both arguments
+	FORCEINLINE CONST m128u16 mm_pack_epu16(m128u16 lo, m128u16 hi)
+	{
+		m128u16 result;
+
+		asm(
+			"ppach %[Result],%[Hi],%[Lo]"
+			: [Result] "=r" (result)
+			: [Lo] "r" (lo), [Hi] "r" (hi)
+		);
+
+		return result;
+	}
+
+	/// @brief PPACW : Parallel PACk to Word
+	/// 
+	/// Select only the values in even positions of both arguments. Store the values from 'lo' to
+	/// the low 2 words of the return value and the values from 'hi' to the high 2 words.
+	/// 
+	/// Bitwise result:
+	///		Return value[ 0,  31]	=	lo[ 0, 31]
+	///		Return value[32,  63]	=	lo[64, 95]
+	///		Return value[64,  95]	=	hi[ 0, 31]
+	///		Return value[96, 127]	=	hi[64, 95]
+	/// @param lo Values to put in the low 2 words of the return value
+	/// @param hi Values to put in the high 2 words of the return value
+	/// @return Packed values of both arguments
+	FORCEINLINE CONST m128i32 mm_pack_epi32(m128i32 lo, m128i32 hi)
+	{
+		m128i32 result;
+
+		asm(
+			"ppacw %[Result],%[Hi],%[Lo]"
+			: [Result] "=r" (result)
+			: [Lo] "r" (lo), [Hi] "r" (hi)
+		);
+
+		return result;
+	}
+
+	/// @brief PPACW : Parallel PACk to Word
+	/// 
+	/// Select only the values in even positions of both arguments. Store the values from 'lo' to
+	/// the low 2 words of the return value and the values from 'hi' to the high 2 words.
+	/// 
+	/// Bitwise result:
+	///		Return value[ 0,  31]	=	lo[ 0, 31]
+	///		Return value[32,  63]	=	lo[64, 95]
+	///		Return value[64,  95]	=	hi[ 0, 31]
+	///		Return value[96, 127]	=	hi[64, 95]
+	/// @param lo Values to put in the low 2 words of the return value
+	/// @param hi Values to put in the high 2 words of the return value
+	/// @return Packed values of both arguments
+	FORCEINLINE CONST m128u32 mm_pack_epu32(m128u32 lo, m128u32 hi)
+	{
+		m128u32 result;
+
+		asm(
+			"ppacw %[Result],%[Hi],%[Lo]"
+			: [Result] "=r" (result)
+			: [Lo] "r" (lo), [Hi] "r" (hi)
+		);
+
+		return result;
+	}
+
+	/// @brief PEXT5 : Parallel EXTend from 5 bits
+	/// 
+	/// Convert pixel coler data from the 16-bit 1-5-5-5 format to the 32-bit 8-8-8-8 format. Only
+	/// the 4 values in even positions in the input argument are converted. Low bits are filled
+	/// with '0', so the alpha channel becomes 1 bit from the input concatenated with 7 '0' bits.
+	/// @param v 1-5-5-5 values to convert
+	/// @return Values converted to 8-8-8-8
+	FORCEINLINE CONST m128u32 mm_ext5_epu16(m128u16 v)
+	{
+		m128u32 result;
+
+		asm(
+			"pext5 %[Result],%[Value]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
+	/// @brief PPAC5 : Parallel PACk to 5 bits
+	/// 
+	/// Convert 4 pixel color values in the 8-8-8-8 format to the 1-5-5-5 format and store it in
+	/// the even positions of the 8 element return value. The odd positions are filled with '0'.
+	/// Color values are truncated, so only the highest bit is used for alpha and only the 5
+	/// highest bits are used for the color channels, others are ignored.
+	/// @param v 8-8-8-8 values to convert
+	/// @return Values converted to 1-5-5-5
+	FORCEINLINE CONST m128u16 mm_pack5_epu32(m128u32 v)
+	{
+		m128u16 result;
+
+		asm(
+			"ppac5 %[Result],%[Value]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
+	/// @brief PLZCW : Parallel Leading Zero or one Count Word
+	/// 
+	/// Uses only the low 64 bits / 2 values from the 4 value argument. For each value, count the
+	/// number of leading bits that have the same value minus 1. This means numbers starting with
+	/// '0b1110...' and '0b0001...' will both return '2' as there are 3 bits of the same value
+	/// beginning at the highest bit and we discard the count of the sign bit.
+	/// @param v Numbers to count leading bits of
+	/// @return Amount of same leading bits minus 1
+	FORCEINLINE CONST m128u32 mm_clb_epi32(m128i32 v)
+	{
+		m128u32 result;
+
+		asm(
+			"plzcw %[Result],%[Value]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
+	/// @brief PLZCW : Parallel Leading Zero or one Count Word
+	/// 
+	/// Uses only the low 64 bits / 2 values from the 4 value argument. For each value, count the
+	/// number of leading bits that have the same value minus 1. This means numbers starting with
+	/// '0b1110...' and '0b0001...' will both return '2' as there are 3 bits of the same value
+	/// beginning at the highest bit and we discard the count of the sign bit.
+	/// @param v Numbers to count leading bits of
+	/// @return Amount of same leading bits minus 1
+	FORCEINLINE CONST m128u32 mm_clb_epu32(m128u32 v)
+	{
+		m128u32 result;
+
+		asm(
+			"plzcw %[Result],%[Value]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
+	/// @brief PLZCW : Parallel Leading Zero or one Count Word
+	/// 
+	/// Split the 64 bit argument into 2 32-bit values. For each value, count the number of
+	/// leading bits that have the same value minus 1. This means numbers starting with
+	/// '0b1110...' and '0b0001...' will both return '2' as there are 3 bits of the same value
+	/// beginning at the highest bit and we discard the count of the sign bit.
+	/// @param v Concatenated numbers to count leading bits of
+	/// @return Concatenated amount of same leading bits minus 1; low 32 bits are the value for
+	/// the low 32 bits of the input argument and the high 32 bits correspond to the high 32 bits
+	/// of the input
+	FORCEINLINE CONST uint64_t mm_clb_u64(uint64_t v)
+	{
+		uint64_t result;
+
+		asm(
+			"plzcw %[Result],%[Value]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
 #ifdef __cplusplus
 }
 #endif
@@ -5931,6 +6934,5 @@ extern "C" {
 #undef UNSEQUENCED
 #undef PURE
 #undef REPRODUCIBLE
-#undef ALIGNAS
-#undef ALIGNVECTOR
+#undef DECLAREVECTOR
 #undef MODE_TI
