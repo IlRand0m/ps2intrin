@@ -2302,6 +2302,8 @@ extern "C" {
 		return result;
 	}
 
+#undef LQ
+
 
 	/// @brief SQ : Store Quadword
 	/// 
@@ -2473,6 +2475,8 @@ extern "C" {
 		SQ(p, value);
 	}
 
+#undef SQ
+
 
 	/// @brief Set a 128-bit packed integer type with given values.
 	/// 
@@ -2507,22 +2511,42 @@ extern "C" {
 	{
 		m128i8 result;
 
-		result[0] = r15;
-		result[1] = r14;
-		result[2] = r13;
-		result[3] = r12;
-		result[4] = r11;
-		result[5] = r10;
-		result[6] = r9;
-		result[7] = r8;
-		result[8] = r7;
-		result[9] = r6;
-		result[10] = r5;
-		result[11] = r4;
-		result[12] = r3;
-		result[13] = r2;
-		result[14] = r1;
-		result[15] = r0;
+		uint64_t lo = r7  & 0xFF;
+		uint64_t hi = r15 & 0xFF;
+		lo <<= 8;
+		lo |= r6  & 0xFF;
+		hi <<= 8;
+		hi |= r14 & 0xFF;
+		lo <<= 8;
+		lo |= r5  & 0xFF;
+		hi <<= 8;
+		hi |= r13 & 0xFF;
+		lo <<= 8;
+		lo |= r4  & 0xFF;
+		hi <<= 8;
+		hi |= r12 & 0xFF;
+		lo <<= 8;
+		lo |= r3  & 0xFF;
+		hi <<= 8;
+		hi |= r11 & 0xFF;
+		lo <<= 8;
+		lo |= r2  & 0xFF;
+		hi <<= 8;
+		hi |= r10 & 0xFF;
+		lo <<= 8;
+		lo |= r1  & 0xFF;
+		hi <<= 8;
+		hi |= r9  & 0xFF;
+		lo <<= 8;
+		lo |= r0  & 0xFF;
+		hi <<= 8;
+		hi |= r8  & 0xFF;
+
+		asm(
+			"pcpyld %[Result],%[Upper],%[Lower]"
+			: [Result] "=r" (result)
+			: [Upper] "r" (hi), [Lower] "r" (lo)
+		);
 
 		return result;
 	}
@@ -2560,22 +2584,42 @@ extern "C" {
 	{
 		m128u8 result;
 
-		result[0] = r15;
-		result[1] = r14;
-		result[2] = r13;
-		result[3] = r12;
-		result[4] = r11;
-		result[5] = r10;
-		result[6] = r9;
-		result[7] = r8;
-		result[8] = r7;
-		result[9] = r6;
-		result[10] = r5;
-		result[11] = r4;
-		result[12] = r3;
-		result[13] = r2;
-		result[14] = r1;
-		result[15] = r0;
+		uint64_t lo = r7  & 0xFF;
+		uint64_t hi = r15 & 0xFF;
+		lo <<= 8;
+		lo |= r6  & 0xFF;
+		hi <<= 8;
+		hi |= r14 & 0xFF;
+		lo <<= 8;
+		lo |= r5  & 0xFF;
+		hi <<= 8;
+		hi |= r13 & 0xFF;
+		lo <<= 8;
+		lo |= r4  & 0xFF;
+		hi <<= 8;
+		hi |= r12 & 0xFF;
+		lo <<= 8;
+		lo |= r3  & 0xFF;
+		hi <<= 8;
+		hi |= r11 & 0xFF;
+		lo <<= 8;
+		lo |= r2  & 0xFF;
+		hi <<= 8;
+		hi |= r10 & 0xFF;
+		lo <<= 8;
+		lo |= r1  & 0xFF;
+		hi <<= 8;
+		hi |= r9  & 0xFF;
+		lo <<= 8;
+		lo |= r0  & 0xFF;
+		hi <<= 8;
+		hi |= r8  & 0xFF;
+
+		asm(
+			"pcpyld %[Result],%[Upper],%[Lower]"
+			: [Result] "=r" (result)
+			: [Upper] "r" (hi), [Lower] "r" (lo)
+		);
 
 		return result;
 	}
@@ -2604,14 +2648,26 @@ extern "C" {
 	{
 		m128i16 result;
 
-		result[0] = r7;
-		result[1] = r6;
-		result[2] = r5;
-		result[3] = r4;
-		result[4] = r3;
-		result[5] = r2;
-		result[6] = r1;
-		result[7] = r0;
+		uint64_t lo = r3 & 0xFFFF;
+		uint64_t hi = r7 & 0xFFFF;
+		lo <<= 16;
+		lo |= r2 & 0xFFFF;
+		hi <<= 16;
+		hi |= r6 & 0xFFFF;
+		lo <<= 16;
+		lo |= r1 & 0xFFFF;
+		hi <<= 16;
+		hi |= r5 & 0xFFFF;
+		lo <<= 16;
+		lo |= r0 & 0xFFFF;
+		hi <<= 16;
+		hi |= r4 & 0xFFFF;
+
+		asm(
+			"pcpyld %[Result],%[Upper],%[Lower]"
+			: [Result] "=r" (result)
+			: [Upper] "r" (hi), [Lower] "r" (lo)
+		);
 
 		return result;
 	}
@@ -2640,14 +2696,26 @@ extern "C" {
 	{
 		m128u16 result;
 
-		result[0] = r7;
-		result[1] = r6;
-		result[2] = r5;
-		result[3] = r4;
-		result[4] = r3;
-		result[5] = r2;
-		result[6] = r1;
-		result[7] = r0;
+		uint64_t lo = r3 & 0xFFFF;
+		uint64_t hi = r7 & 0xFFFF;
+		lo <<= 16;
+		lo |= r2 & 0xFFFF;
+		hi <<= 16;
+		hi |= r6 & 0xFFFF;
+		lo <<= 16;
+		lo |= r1 & 0xFFFF;
+		hi <<= 16;
+		hi |= r5 & 0xFFFF;
+		lo <<= 16;
+		lo |= r0 & 0xFFFF;
+		hi <<= 16;
+		hi |= r4 & 0xFFFF;
+
+		asm(
+			"pcpyld %[Result],%[Upper],%[Lower]"
+			: [Result] "=r" (result)
+			: [Upper] "r" (hi), [Lower] "r" (lo)
+		);
 
 		return result;
 	}
@@ -2672,10 +2740,18 @@ extern "C" {
 	{
 		m128i32 result;
 
-		result[0] = r3;
-		result[1] = r2;
-		result[2] = r1;
-		result[3] = r0;
+		uint64_t lo = r1 & 0xFFFFFFFF;
+		uint64_t hi = r3 & 0xFFFFFFFF;
+		lo <<= 32;
+		lo |= r0 & 0xFFFFFFFF;
+		hi <<= 32;
+		hi |= r2 & 0xFFFFFFFF;
+
+		asm(
+			"pcpyld %[Result],%[Upper],%[Lower]"
+			: [Result] "=r" (result)
+			: [Upper] "r" (hi), [Lower] "r" (lo)
+		);
 
 		return result;
 	}
@@ -2700,10 +2776,18 @@ extern "C" {
 	{
 		m128u32 result;
 
-		result[0] = r3;
-		result[1] = r2;
-		result[2] = r1;
-		result[3] = r0;
+		uint64_t lo = r1 & 0xFFFFFFFF;
+		uint64_t hi = r3 & 0xFFFFFFFF;
+		lo <<= 32;
+		lo |= r0 & 0xFFFFFFFF;
+		hi <<= 32;
+		hi |= r2 & 0xFFFFFFFF;
+
+		asm(
+			"pcpyld %[Result],%[Upper],%[Lower]"
+			: [Result] "=r" (result)
+			: [Upper] "r" (hi), [Lower] "r" (lo)
+		);
 
 		return result;
 	}
@@ -2726,8 +2810,11 @@ extern "C" {
 	{
 		m128i64 result;
 
-		result[0] = r1;
-		result[1] = r0;
+		asm(
+			"pcpyld %[Result],%[Upper],%[Lower]"
+			: [Result] "=r" (result)
+			: [Upper] "r" (r1), [Lower] "r" (r0)
+		);
 
 		return result;
 	}
@@ -2750,8 +2837,11 @@ extern "C" {
 	{
 		m128u64 result;
 
-		result[0] = r1;
-		result[1] = r0;
+		asm(
+			"pcpyld %[Result],%[Upper],%[Lower]"
+			: [Result] "=r" (result)
+			: [Upper] "r" (r1), [Lower] "r" (r0)
+		);
 
 		return result;
 	}
@@ -2763,7 +2853,8 @@ extern "C" {
 	/// @return Packed integer type initialized to the given values
 	FORCEINLINE CONST m128i128 mm_set_epi128(int128_t r0)
 	{
-		m128i128 result = { r0 };
+		m128i128 result;
+		memcpy(&result, &r0, sizeof(m128i128));
 		return result;
 	}
 
@@ -2774,7 +2865,8 @@ extern "C" {
 	/// @return Packed integer type initialized to the given values
 	FORCEINLINE CONST m128u128 mm_set_epu128(uint128_t r0)
 	{
-		m128u128 result = { r0 };
+		m128u128 result;
+		memcpy(&result, &r0, sizeof(m128i128));
 		return result;
 	}
 	
@@ -4788,7 +4880,7 @@ extern "C" {
 	/// 'm128u16'
 	/// @param value Variable identifier to use as source value. Must be of type 'm128i16' or
 	/// 'm128u16'
-	/// @param shift_value Amount of bits to shift the source value left. Must be in range [0, 15]
+	/// @param shift_amount Amount of bits to shift the source value left. Must be in range [0, 15]
 #define PSLLH(result, value, shift_amount)															\
 		asm(																						\
 			"psllh %[Result],%[Value],%c[ShiftAmount]"												\
@@ -4803,7 +4895,7 @@ extern "C" {
 	/// 'm128u32'
 	/// @param value Variable identifier to use as source value. Must be of type 'm128i32' or
 	/// 'm128u32'
-	/// @param shift_value Amount of bits to shift the source value left. Must be in range [0, 31]
+	/// @param shift_amount Amount of bits to shift the source value left. Must be in range [0, 31]
 #define PSLLW(result, value, shift_amount)															\
 		asm(																						\
 			"psllw %[Result],%[Value],%c[ShiftAmount]"												\
@@ -4837,7 +4929,7 @@ extern "C" {
 	/// Arithmetically right shift 16-bit values. Shifts in sign bits into the upper bits.
 	/// @param result Variable identifier to store result to. Must be of type 'm128i16'
 	/// @param value Variable identifier to use as source value. Must be of type 'm128i16'
-	/// @param shift_value Amount of bits to shift the source value right. Must be in range [0, 15]
+	/// @param shift_amount Amount of bits to shift the source value right. Must be in range [0, 15]
 #define PSRAH(result, value, shift_amount)															\
 		asm(																						\
 			"psrah %[Result],%[Value],%c[ShiftAmount]"												\
@@ -4850,7 +4942,7 @@ extern "C" {
 	/// Arithmetically right shift 32-bit values. Shifts in sign bits into the upper bits.
 	/// @param result Variable identifier to store result to. Must be of type 'm128i32'
 	/// @param value Variable identifier to use as source value. Must be of type 'm128i32'
-	/// @param shift_value Amount of bits to shift the source value left. Must be in range [0, 31]
+	/// @param shift_amount Amount of bits to shift the source value left. Must be in range [0, 31]
 #define PSRAW(result, value, shift_amount)															\
 		asm(																						\
 			"psraw %[Result],%[Value],%c[ShiftAmount]"												\
@@ -4885,7 +4977,7 @@ extern "C" {
 	/// Logically right shift 16-bit values. Shifts in '0's into the upper bits.
 	/// @param result Variable identifier to store result to. Must be of type 'm128u16'
 	/// @param value Variable identifier to use as source value. Must be of type 'm128u16'
-	/// @param shift_value Amount of bits to shift the source value right. Must be in range [0, 15]
+	/// @param shift_amount Amount of bits to shift the source value right. Must be in range [0, 15]
 #define PSRLH(result, value, shift_amount)															\
 		asm(																						\
 			"psrlh %[Result],%[Value],%c[ShiftAmount]"												\
@@ -4898,7 +4990,7 @@ extern "C" {
 	/// Logically right shift 32-bit values. Shifts in '0's into the upper bits.
 	/// @param result Variable identifier to store result to. Must be of type 'm128u32'
 	/// @param value Variable identifier to use as source value. Must be of type 'm128u32'
-	/// @param shift_value Amount of bits to shift the source value left. Must be in range [0, 31]
+	/// @param shift_amount Amount of bits to shift the source value left. Must be in range [0, 31]
 #define PSRLW(result, value, shift_amount)															\
 		asm(																						\
 			"psrlw %[Result],%[Value],%c[ShiftAmount]"												\
@@ -5289,6 +5381,27 @@ extern "C" {
 			"padduw %[Result],%[Left],%[Right]"
 			: [Result] "=r" (result)
 			: [Left] "%r" (l), [Right] "r" (r)
+		);
+
+		return result;
+	}
+
+	/// @brief PADSBH : Parallel ADd/SuBtract Halfword
+	/// 
+	/// Split each group of 8 16-bit signed values into a high and a low group of 4. Valculate
+	/// 'l + r' for the high group and 'l - r' for the low group. This uses regular non-saturating
+	/// arithmethic.
+	/// @param l First operand
+	/// @param r Second operand
+	/// @return Result of addition/subtraction of operands
+	FORCEINLINE CONST m128i16 mm_addsub_epi16(m128i16 l, m128i16 r)
+	{
+		m128i16 result;
+
+		asm(
+			"padsbh %[Result],%[Left],%[Right]"
+			: [Result] "=r" (result)
+			: [Left] "r" (l), [Right] "r" (r)
 		);
 
 		return result;
@@ -5786,6 +5899,102 @@ extern "C" {
 			: [Result] "=r" (result)
 			: [Left] "%r" (l), [Right] "r" (r)
 		);
+
+		return result;
+	}
+
+	/// @brief PHMADH : Parallel Horizontal Multiply-ADd Halfword
+	/// 
+	/// Split 8 signed 16-bit values into 4 groups of 2. Multiply corresponding values from both
+	/// operands into intermediate 32-bit values. Add the 2 intermediate values within a group.
+	/// The result of group 0 (input values at index 0 and 1) is written to the return value at
+	/// index 0 and the LO register at bits [0, 31]. The result of group 1 (input values at index
+	/// 2 and 3) is written to the return value at index 1 and the HI register at bits [0, 31].
+	/// The result of group 2 (4 and 5) is at index 2 and in LO[64, 95]. The result of group 3 (6
+	/// and 7) is at index 3 and in HI[64, 95].
+	/// 
+	/// Bitwise result:
+	///		tmp0	=	l[0, 15] * r[0, 15] + l[16, 31] * r[16, 31]
+	///		tmp1	=	l[0, 15] * r[0, 15] + l[16, 31] * r[16, 31]
+	///		tmp2	=	l[0, 15] * r[0, 15] + l[16, 31] * r[16, 31]
+	///		tmp3	=	l[0, 15] * r[0, 15] + l[16, 31] * r[16, 31]
+	///		Return value[ 0,  31]	=	tmp0
+	///		Return value[32,  63]	=	tmp1
+	///		Return value[64,  95]	=	tmp2
+	///		Return value[96, 127]	=	tmp3
+	///		LO[ 0,  31]	=	tmp0
+	///		LO[32,  63]	=	<undefined>
+	///		LO[64,  95]	=	tmp2
+	///		LO[96, 127]	=	<undefined>
+	///		HI[ 0,  31]	=	tmp1
+	///		HI[32,  63]	=	<undefined>
+	///		HI[64,  95]	=	tmp3
+	///		HI[96, 127]	=	<undefined>
+	/// 
+	/// Multiplication happens asynchronously. Reading from the return value, the LO or the HI
+	/// register will stall the EE Core until the result is ready.
+	/// 
+	/// This function writes to global state (LO/HI).
+	/// @param l First Operand
+	/// @param r Second Operand
+	/// @return Horizontal sums of multiplication products
+	FORCEINLINE m128i32 mm_hmuladd_epi16(m128i16 l, m128i16 r)
+	{
+		m128i32 result;
+
+		asm volatile(
+			"phmadh %[Result],%[Left],%[Right]"
+			: [Result] "=r" (result)
+			: [Left] "%r" (l), [Right] "r" (r)
+		);
+
+		return result;
+	}
+
+	/// @brief PHMSBH : Parallel Horizontal Multiply-SuBtract Halfword
+	/// 
+	/// Split 8 signed 16-bit values into 4 groups of 2. Multiply corresponding values from both
+	/// operands into intermediate 32-bit values. Subtract the 2 intermediate values within a
+	/// group. The result of group 0 (input values at index 0 and 1) is written to the return
+	/// value at index 0 and the LO register at bits [0, 31]. The result of group 1 (input values
+	/// at index 2 and 3) is written to the return value at index 1 and the HI register at bits
+	/// [0, 31]. The result of group 2 (4 and 5) is at index 2 and in LO[64, 95]. The result of
+	/// group 3 (6 and 7) is at index 3 and in HI[64, 95].
+	/// 
+	/// Bitwise result:
+	///		tmp0	=	l[0, 15] * r[0, 15] - l[16, 31] * r[16, 31]
+	///		tmp1	=	l[0, 15] * r[0, 15] - l[16, 31] * r[16, 31]
+	///		tmp2	=	l[0, 15] * r[0, 15] - l[16, 31] * r[16, 31]
+	///		tmp3	=	l[0, 15] * r[0, 15] - l[16, 31] * r[16, 31]
+	///		Return value[ 0,  31]	=	tmp0
+	///		Return value[32,  63]	=	tmp1
+	///		Return value[64,  95]	=	tmp2
+	///		Return value[96, 127]	=	tmp3
+	///		LO[ 0,  31]	=	tmp0
+	///		LO[32,  63]	=	<undefined>
+	///		LO[64,  95]	=	tmp2
+	///		LO[96, 127]	=	<undefined>
+	///		HI[ 0,  31]	=	tmp1
+	///		HI[32,  63]	=	<undefined>
+	///		HI[64,  95]	=	tmp3
+	///		HI[96, 127]	=	<undefined>
+	/// 
+	/// Multiplication happens asynchronously. Reading from the return value, the LO or the HI
+	/// register will stall the EE Core until the result is ready.
+	/// 
+	/// This function writes to global state (LO/HI).
+	/// @param l First Operand
+	/// @param r Second Operand
+	/// @return Horizontal differences of multiplication products
+	FORCEINLINE m128i32 mm_hmulsub_epi16(m128i16 l, m128i16 r)
+	{
+		m128i32 result;
+
+		asm volatile(
+			"phmsbh %[Result],%[Left],%[Right]"
+			: [Result] "=r" (result)
+			: [Left] "%r" (l), [Right] "r" (r)
+			);
 
 		return result;
 	}
@@ -6449,7 +6658,7 @@ extern "C" {
 	/// @param even Values to put in even positions in the return value
 	/// @param odd Values to put in odd positions in the return value
 	/// @return Interleaved values from both arguments
-	FORCEINLINE CONST m128i32 mm_extlo_epi326(m128i32 even, m128i32 odd)
+	FORCEINLINE CONST m128i32 mm_extlo_epi32(m128i32 even, m128i32 odd)
 	{
 		m128i32 result;
 
@@ -6927,6 +7136,266 @@ extern "C" {
 
 #ifdef __cplusplus
 
+/*
+* 
+* Template wrappers around the function macros.
+* 
+* It would be great to have a C++ wrapper around the Multimedia and VU0 instructions. That exists
+* in the form of 'std::simd' for C++26. The experimental version is already in GCC and works even
+* when compiling for PS2 but doesn't use the intrinsics. It would be great if someone could change
+* that instead of reimplementing 'std::simd' here.
+* 
+*/
+
+
+namespace
+{
+	/// @brief PREF : PREFetch
+	/// 
+	/// Prefetch data from memory to the cache.
+	/// 
+	/// Can set specific hint value. Only 0 is supported as this value, other values are
+	/// reserved. Possible values: [0, 32). Prefer using the function 'prefetch' instead.
+	/// 
+	/// Does nothing on uncached memory locations.
+	/// 
+	/// Not allowed on memory locations not present in the TLB. Not recently used pages may not
+	/// be present in the TLB, reducing effectiveness. Prefetch may not happen when the memory
+	/// bus is used.
+	/// @tparam Hint The hint value to use
+	/// @param ptr The address to prefetch
+	template <unsigned Hint>
+	FORCEINLINE void prefetch(void* ptr) noexcept
+	{
+		PREF(ptr, (Hint));
+	}
+
+	/// @brief MTSAB : Move byte count To Shift Amount register (Byte)
+	/// 
+	/// Set a byte shift count in the shift amount register.
+	/// 
+	/// The values of 'byte_amount' and 'FixedByteAmount' are XOR'ed together. The resulting value
+	/// is the amount of bytes 'byte_shift_logical_right' will shift by.
+	/// 
+	/// Allowable values for 'byte_amount' and 'FixedByteAmount' are [0,15]. Only the lower 4 bits
+	/// are used, others are ignored.
+	/// 
+	/// Use this if you require both the variable and constant values usable by the 'mtsab'
+	/// instruction. Otherwise, prefer the no argument overload if you only have a constant value
+	/// and non-template 'set_sa_8' if you only have a variable shift amount.
+	/// 
+	/// This function writes to global state (SA).
+	/// @tparam FixedByteAmount The compile time constant byte-amount to set up the shift amount
+	/// register for
+	/// @param byte_amount The variable byte-amount to set up the shift amount register for
+	template <unsigned FixedByteAmount>
+	FORCEINLINE void set_sa_8(unsigned byte_amount) noexcept
+	{
+		MTSAB_BOTH(byte_amount, (FixedByteAmount));
+	}
+
+	/// @brief MTSAB : Move byte count To Shift Amount register (Byte)
+	/// 
+	/// Set a byte shift count in the shift amount register.
+	/// 
+	/// The 'FixedByteAmount' value is the amount of bytes 'byte_shift_logical_right' will shift by.
+	/// 
+	/// Allowable values for 'FixedByteAmount' are [0,15]. Only the lower 4 bits are used, others
+	/// are ignored.
+	/// 
+	/// Use this function if your shift amount is known at compile time. Using this function does not
+	/// use a general purpose register. Otherwise, prefer the overload with argument or non-template
+	/// overload.
+	/// 
+	/// This function writes to global state (SA).
+	/// @tparam FixedByteAmount The compile time constant byte-amount to set up the shift amount
+	/// register for
+	template <unsigned FixedByteAmount>
+	FORCEINLINE void set_sa_8() noexcept
+	{
+		MTSAB_IMMEDIATE((FixedByteAmount));
+	}
+
+	/// @brief MTSAH : Move halfword count To Shift Amount register (Halfword)
+	/// 
+	/// Set a halfword shift count in the shift amount register.
+	/// 
+	/// The values of 'halfword_amount' and 'FixedHalfwordAmount' are XOR'ed together. The
+	/// resulting value is the amount of halfwords 'byte_shift_logical_right' will shift by.
+	/// 
+	/// Allowable values for 'halfword_amount' and 'FixedHalfwordAmount' are [0,7]. Only the
+	/// lower 3 bits are used, others are ignored.
+	/// 
+	/// Use this function if you require both the variable and constant values usable by the
+	/// 'mtsah' instruction. Otherwise, prefer the no-argument overload if you only have a
+	/// constant value and the non-template overload if you only have a variable shift amount.
+	/// 
+	/// This function writes to global state (SA).
+	/// @tparam FixedHalfwordAmount The compile time constant halfword-amount to set up the shift
+	/// amount register for
+	/// @param halfword_amount The variable halfword-amount to set up the shift amount register
+	/// for
+	template <unsigned FixedHalfwordAmount>
+	FORCEINLINE void set_sa_16(unsigned halfword_amount) noexcept
+	{
+		MTSAH_BOTH(halfword_amount, (FixedHalfwordAmount));
+	}
+
+	/// @brief MTSAH : Move halfword count To Shift Amount register (Halfword)
+	/// 
+	/// Set a halfword shift count in the shift amount register.
+	/// 
+	/// The 'FixedHalfwordAmount' value is the amount of halfwords 'byte_shift_logical_right'
+	/// will shift by.
+	/// 
+	/// Allowable values for 'immediate' are [0,7]. Only the lower 3 bits are used, others are
+	/// ignored.
+	/// 
+	/// Use this function if your shift amount is known at compile time. Using this function does
+	/// not use a general purpose register. Otherwise, prefer the overload with an argument or
+	/// the non-template overload.
+	/// 
+	/// This function writes to global state (SA).
+	/// @tparam FixedHalfwordAmount The compile time constant halfword-amount to set up the shift
+	/// amount register for
+	template <unsigned FixedHalfwordAmount>
+	FORCEINLINE void set_sa_16() noexcept
+	{
+		MTSAH_IMMEDIATE((FixedHalfwordAmount));
+	}
+
+	/// @brief PSLLH : Parallel Shift Left Logical Halfword
+	/// 
+	/// Logically left shift 16-bit values. Shifts in '0's into the lower bits.
+	/// @tparam ShiftAmount Amount of bits to shift the source value left. Must be in range [0, 15]
+	/// @param v Value to shift
+	/// @return Shifted values
+	template <unsigned ShiftAmount>
+	FORCEINLINE CONST m128i16 mm_sll_epi16(m128i16 v) noexcept
+	{
+		m128i16 result;
+
+		PSLLH(result, v, (ShiftAmount));
+
+		return result;
+	}
+
+	/// @brief PSLLH : Parallel Shift Left Logical Halfword
+	/// 
+	/// Logically left shift 16-bit values. Shifts in '0's into the lower bits.
+	/// @tparam ShiftAmount Amount of bits to shift the source value left. Must be in range [0, 15]
+	/// @param v Values to shift
+	/// @return Shifted values
+	template <unsigned ShiftAmount>
+	FORCEINLINE CONST m128u16 mm_sll_epu16(m128u16 v) noexcept
+	{
+		m128u16 result;
+
+		PSLLH(result, v, (ShiftAmount));
+
+		return result;
+	}
+
+	/// @brief PSLLW : Parallel Shift Left Logical Word
+	/// 
+	/// Logically left shift 32-bit values. Shifts in '0's into the lower bits.
+	/// @tparam ShiftAmount Amount of bits to shift the source value left. Must be in range [0, 31]
+	/// @param v Values to shift
+	/// @return Shifted values
+	template <unsigned ShiftAmount>
+	FORCEINLINE CONST m128i32 mm_sll_epi32(m128i32 v) noexcept
+	{
+		m128i32 result;
+
+		PSLLW(result, v, (ShiftAmount));
+
+		return result;
+	}
+
+	/// @brief PSLLW : Parallel Shift Left Logical Word
+	/// 
+	/// Logically left shift 32-bit values. Shifts in '0's into the lower bits.
+	/// @tparam ShiftAmount Amount of bits to shift the source value left. Must be in range [0, 31]
+	/// @param v Values to shift
+	/// @return Shifted values
+	template <unsigned ShiftAmount>
+	FORCEINLINE CONST m128u32 mm_sll_epu32(m128u32 v) noexcept
+	{
+		m128u32 result;
+
+		PSLLW(result, v, (ShiftAmount));
+
+		return result;
+	}
+
+	/// @brief PSRAH : Parallel Shift Right Arithmetic Halfword
+	/// 
+	/// Arithmetically right shift 16-bit values. Shifts in sign bits into the upper bits.
+	/// @tparam ShiftAmount Amount of bits to shift the source value right. Must be in range
+	/// [0, 15]
+	/// @param v Values to shift
+	/// @return Shifted values
+	template <unsigned ShiftAmount>
+	FORCEINLINE CONST m128i16 mm_sra_epi16(m128i16 v) noexcept
+	{
+		m128i16 result;
+
+		PSRAH(result, v, (ShiftAmount));
+
+		return result;
+	}
+
+	/// @brief PSRAW : Parallel Shift Right Arithmetic Word
+	/// 
+	/// Arithmetically right shift 32-bit values. Shifts in sign bits into the upper bits.
+	/// @tparam ShiftAmount Amount of bits to shift the source value right. Must be in range
+	/// [0, 31]
+	/// @param v Values to shift
+	/// @return Shifted values
+	template <unsigned ShiftAmount>
+	FORCEINLINE CONST m128i32 mm_sra_epi32(m128i32 v) noexcept
+	{
+		m128i32 result;
+
+		PSRAW(result, v, (ShiftAmount));
+
+		return result;
+	}
+
+	/// @brief PSRLH : Parallel Shift Right Logical Halfword
+	/// 
+	/// Logically right shift 16-bit values. Shifts in '0's into the upper bits.
+	/// @tparam ShiftAmount Amount of bits to shift the source value right. Must be in range
+	/// [0, 15]
+	/// @param v Values to shift
+	/// @return Shifted values
+	template <unsigned ShiftAmount>
+	FORCEINLINE CONST m128u16 mm_srl_epu16(m128i16 v) noexcept
+	{
+		m128u16 result;
+
+		PSRLH(result, v, (ShiftAmount));
+
+		return result;
+	}
+
+	/// @brief PSRLW : Parallel Shift Right Logical Word
+	/// 
+	/// Logically right shift 32-bit values. Shifts in '0's into the upper bits.
+	/// @tparam ShiftAmount Amount of bits to shift the source value right. Must be in range
+	/// [0, 31]
+	/// @param v Values to shift
+	/// @return Shifted values
+	template <unsigned ShiftAmount>
+	FORCEINLINE CONST m128u32 mm_srl_epu32(m128u32 v) noexcept
+	{
+		m128u32 result;
+
+		PSRLW(result, v, (ShiftAmount));
+
+		return result;
+	}
+}
 #endif
 
 #undef FORCEINLINE
