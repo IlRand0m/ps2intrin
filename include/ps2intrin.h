@@ -2395,7 +2395,7 @@ extern "C" {
 	/// This function writes to global state (*'address')
 	/// @param p Address to store to.
 	/// @return Packed integer data to store to the memory location.
-	FORCEINLINE UNSEQUENCED void mm_store_epi32(m128i8* p, m128i32 value)
+	FORCEINLINE UNSEQUENCED void mm_store_epi32(m128i32* p, m128i32 value)
 	{
 		SQ(p, value);
 	}
