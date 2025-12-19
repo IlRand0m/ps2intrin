@@ -23,7 +23,7 @@
 #endif
 
 #include <stdint.h>
-#include <string.h>		//	for memcpy
+#include <string.h>
 
 // This is mostly here to make working with IntelliSense easier.
 #if defined(_MSC_VER)
@@ -32,7 +32,7 @@
 #define UNSEQUENCED __declspec(noalias)
 #define PURE __declspec(noalias)
 #define REPRODUCIBLE __declspec(noalias)
-#define DECLAREVECTOR(base, name) typedef __declspec(align(16)) base name [16 / sizeof( base )]
+#define DECLAREVECTOR(base, name) typedef __declspec(align(16)) struct { base v[16 / sizeof( base )]; } name
 #define MODE_TI
 #elif defined(__GNUC__)
 // Always inline this function into the caller. Must be both
