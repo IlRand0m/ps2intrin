@@ -1958,7 +1958,7 @@ extern "C" {
 		m128i8 result;
 
 		asm(
-			"move %[Result],$0"
+			"por %[Result],$0,$0"		// just using 'move' makes assembler think we only mean lower 64 bits
 			: [Result] "=r" (result)
 		);
 
@@ -1972,7 +1972,7 @@ extern "C" {
 		m128u8 result;
 
 		asm(
-			"move %[Result],$0"
+			"por %[Result],$0,$0"		// just using 'move' makes assembler think we only mean lower 64 bits
 			: [Result] "=r" (result)
 		);
 
@@ -1986,7 +1986,7 @@ extern "C" {
 		m128i16 result;
 
 		asm(
-			"move %[Result],$0"
+			"por %[Result],$0,$0"		// just using 'move' makes assembler think we only mean lower 64 bits
 			: [Result] "=r" (result)
 		);
 
@@ -2000,7 +2000,7 @@ extern "C" {
 		m128u16 result;
 
 		asm(
-			"move %[Result],$0"
+			"por %[Result],$0,$0"		// just using 'move' makes assembler think we only mean lower 64 bits
 			: [Result] "=r" (result)
 		);
 
@@ -2014,7 +2014,7 @@ extern "C" {
 		m128i32 result;
 
 		asm(
-			"move %[Result],$0"
+			"por %[Result],$0,$0"		// just using 'move' makes assembler think we only mean lower 64 bits
 			: [Result] "=r" (result)
 		);
 
@@ -2028,7 +2028,7 @@ extern "C" {
 		m128u32 result;
 
 		asm(
-			"move %[Result],$0"
+			"por %[Result],$0,$0"		// just using 'move' makes assembler think we only mean lower 64 bits
 			: [Result] "=r" (result)
 		);
 
@@ -2042,7 +2042,7 @@ extern "C" {
 		m128i64 result;
 
 		asm(
-			"move %[Result],$0"
+			"por %[Result],$0,$0"		// just using 'move' makes assembler think we only mean lower 64 bits
 			: [Result] "=r" (result)
 		);
 
@@ -2056,7 +2056,7 @@ extern "C" {
 		m128u64 result;
 
 		asm(
-			"move %[Result],$0"
+			"por %[Result],$0,$0"		// just using 'move' makes assembler think we only mean lower 64 bits
 			: [Result] "=r" (result)
 		);
 
@@ -2070,7 +2070,7 @@ extern "C" {
 		m128i128 result;
 
 		asm(
-			"move %[Result],$0"
+			"por %[Result],$0,$0"		// just using 'move' makes assembler think we only mean lower 64 bits
 			: [Result] "=r" (result)
 		);
 
@@ -2084,7 +2084,7 @@ extern "C" {
 		m128u128 result;
 
 		asm(
-			"move %[Result],$0"
+			"por %[Result],$0,$0"		// just using 'move' makes assembler think we only mean lower 64 bits
 			: [Result] "=r" (result)
 		);
 
