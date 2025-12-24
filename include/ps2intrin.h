@@ -2982,6 +2982,123 @@ extern "C" {
 
 #undef CAST
 
+	/// @brief Broadcast Byte
+	/// 
+	/// Broadcast an 8-bit value to all 16 positions in a 128-bit value.
+	/// @param v 8-bit value to broadcast
+	/// @return 128-value with broadcasted values
+	FORCEINLINE PURE m128i8 mm_broadcast_epi8(int8_t v)
+	{
+		m128i8 result;
+
+		asm(
+			"pextlb %[Result],%[Value],%[Value]\n\t"
+			"pcpyld %[Result],%[Result],%[Result]\n\t"
+			"pcpyh %[Result],%[Result]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
+	/// @brief Broadcast Byte
+	/// 
+	/// Broadcast an 8-bit value to all 16 positions in a 128-bit value.
+	/// @param v 8-bit value to broadcast
+	/// @return 128-value with broadcasted values
+	FORCEINLINE PURE m128u8 mm_broadcast_epu8(uint8_t v)
+	{
+		return mm_castepu8_epi8(mm_broadcast_epi8((int8_t)v));
+	}
+
+	/// @brief Broadcast Halfword
+	/// 
+	/// Broadcast a 16-bit value to all 8 positions in a 128-bit value.
+	/// @param v 16-bit value to broadcast
+	/// @return 128-value with broadcasted values
+	FORCEINLINE PURE m128i16 mm_broadcast_epi16(int16_t v)
+	{
+		m128i16 result;
+
+		asm(
+			"pcpyld %[Result],%[Value],%[Value]\n\t"
+			"pcpyh %[Result],%[Result]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
+	/// @brief Broadcast Halfword
+	/// 
+	/// Broadcast a 16-bit value to all 8 positions in a 128-bit value.
+	/// @param v 16-bit value to broadcast
+	/// @return 128-value with broadcasted values
+	FORCEINLINE PURE m128u16 mm_broadcast_epu16(uint16_t v)
+	{
+		return mm_castepu16_epi16(mm_broadcast_epi16((int16_t)v));
+	}
+
+	/// @brief Broadcast Word
+	/// 
+	/// Broadcast a 32-bit value to all 4 positions in a 128-bit value.
+	/// @param v 32-bit value to broadcast
+	/// @return 128-value with broadcasted values
+	FORCEINLINE PURE m128i32 mm_broadcast_epi32(int32_t v)
+	{
+		m128i32 result;
+
+		asm(
+			"pextlw %[Result],%[Value],%[Value]\n\t"
+			"pcpyld %[Result],%[Result],%[Result]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
+	/// @brief Broadcast Word
+	/// 
+	/// Broadcast a 32-bit value to all 4 positions in a 128-bit value.
+	/// @param v 32-bit value to broadcast
+	/// @return 128-value with broadcasted values
+	FORCEINLINE PURE m128u32 mm_broadcast_epu32(uint32_t v)
+	{
+		return mm_castepu32_epi32(mm_broadcast_epi32((int32_t)v));
+	}
+
+	/// @brief Broadcast Doubleword
+	/// 
+	/// Broadcast a 64-bit value to all 2 positions in a 128-bit value.
+	/// @param v 64-bit value to broadcast
+	/// @return 128-value with broadcasted values
+	FORCEINLINE PURE m128i64 mm_broadcast_epi64(int64_t v)
+	{
+		m128i64 result;
+
+		asm(
+			"pcpyld %[Result],%[Value],%[Value]"
+			: [Result] "=r" (result)
+			: [Value] "r" (v)
+		);
+
+		return result;
+	}
+
+	/// @brief Broadcast Doubleword
+	/// 
+	/// Broadcast a 64-bit value to all 2 positions in a 128-bit value.
+	/// @param v 64-bit value to broadcast
+	/// @return 128-value with broadcasted values
+	FORCEINLINE PURE m128u64 mm_broadcast_epu64(uint64_t v)
+	{
+		return mm_castepu64_epi64(mm_broadcast_epi64((int64_t)v));
+	}
+
+
 	/// @brief PMFLO : Parallel Move From LO register
 	/// 
 	/// Read the entire LO register and interpret its contents as signed 16-bit integers.
