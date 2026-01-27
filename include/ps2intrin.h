@@ -25,6 +25,10 @@
 #include <stdint.h>
 #include <string.h>
 
+#if defined(PS2INTRIN_UNSAFE) && !defined(PS2INTRIN_SILENCE_UNSAFE)
+#pragma message "Using unsafe ps2intrin mode. Check correctness of generated code."
+#endif
+
 // This is mostly here to make working with IntelliSense easier.
 #if defined(_MSC_VER)
 #define FORCEINLINE __forceinline inline
@@ -32,7 +36,9 @@
 #define UNSEQUENCED __declspec(noalias)
 #define PURE __declspec(noalias)
 #define REPRODUCIBLE __declspec(noalias)
-#define DECLAREVECTOR(base, name) typedef __declspec(align(16)) struct { base v[16 / sizeof( base )]; } name
+#define ALIGNAS16 __declspec(align(16))
+#define DECLAREVECTOR_SAFE(base, name) typedef __declspec(align(16)) struct { uint64_t lo; uint64_t hi; } name
+#define DECLAREVECTOR_UNSAFE(base, name) typedef __declspec(align(16)) struct { uint64_t v; } name
 #define MODE_TI
 #elif defined(__GNUC__)
 // Always inline this function into the caller. Must be both
@@ -48,8 +54,14 @@
 // This function only reads arguments, global state, returns a value and reads or writes memory
 // through pointers in function arguments.
 #define REPRODUCIBLE __attribute__ ((reproducible))
-// Declare a 16-byte vector type of base type 'base' and name 'name' with 16-byte alignment.
-#define DECLAREVECTOR(base, name) typedef base __attribute__ ((vector_size(16), aligned(16))) name
+// This type must be aligned to a 16-byte boundary
+#define ALIGNAS16 __attribute__ ((aligned(16)))
+// In unsafe mode any 16-byte vector actually uses a struct with a single uint64_t in it. This
+// ensures 16 byte size and alignment, but means an additional (zero) register has to be used.
+#define DECLAREVECTOR_UNSAFE(base, name) typedef struct { uint64_t v; } __attribute__ ((aligned(16))) name
+// In safe mode any 16-byte vector uses a struct of 2 uint64_t to be able to name both the upper and
+// lower 8 bytes.
+#define DECLAREVECTOR_SAFE(base, name) typedef struct { uint64_t lo; uint64_t hi; } __attribute__ ((aligned(16))) name
 // Integer size of 128 bits specifier
 #define MODE_TI __attribute__((mode(TI)))
 #else
@@ -59,8 +71,15 @@
 #define UNSEQUENCED
 #define PURE
 #define REPRODUCIBLE
-#define DECLAREVECTOR(base, name) typedef base name [16 / sizeof( base )]
+#define ALIGNAS16
+#define DECLAREVECTOR(base, name) typedef struct { uint64_t lo; uint64_t hi; } name
 #define MODE_TI
+#endif
+
+#ifdef PS2INTRIN_UNSAFE
+#define DECLAREVECTOR DECLAREVECTOR_UNSAFE
+#else
+#define DECLAREVECTOR DECLAREVECTOR_SAFE
 #endif
 
 
@@ -70,8 +89,38 @@ extern "C" {
 
 	// Types
 
-	typedef int int128_t MODE_TI;
-	typedef unsigned uint128_t MODE_TI;
+	/// @brief Signed 128-bit integer
+	///
+	/// Actually uses the low 64 bits of 2 registers. Functions using this type will always
+	/// combine both parts into a single 128-bit value regardless of whether PS2INTRIN_UNSAFE
+	/// is defined.
+	typedef int ALIGNAS16 int128_t MODE_TI;
+
+	/// @brief Unsigned 128-bit integer
+	///
+	/// Actually uses the low 64 bits of 2 registers. Functions using this type will always
+	/// combine both parts into a single 128-bit value regardless of whether PS2INTRIN_UNSAFE
+	/// is defined.
+	typedef unsigned ALIGNAS16 uint128_t MODE_TI;
+
+	/// @brief Type containing state of LO/HI registers. Used in safe mode to maintain expected
+	/// values regardless of other instructions executed around desired intrinsics.
+	/// Completely ignored if PS2INTRIN_UNSAFE is defined.
+	typedef struct
+	{
+#ifndef PS2INTRIN_UNSAFE
+		uint64_t lo[2];
+		uint64_t hi[2];
+#endif
+	} lohi_state_t;
+
+	/// @brief Type containing state of SA register. Used in safe mode to maintain expected
+	/// value regardless of other instructions executed around desired intrinsics.
+	/// Completely ignored if PS2INTRIN_UNSAFE is defined.
+	typedef struct
+	{
+		uint64_t sa;
+	} sa_state_t;
 
 	/// @brief Result type of signed 32-bit multiplication
 	typedef struct
@@ -196,7 +245,7 @@ extern "C" {
 	/// @param hint The hint value to use. Must be an integer literal.
 #define PREF(address, hint)																			\
 	asm(												/* implicitly volatile	*/					\
-		"pref %c[Hint],%a[Address]"																	\
+		"pref	%c[Hint],%a[Address]"																\
 		:												/* output operands	*/						\
 		: [Hint] "n" (hint), [Address] "ZD" (address)	/* input operands	Per GCC documentation,	\
 														ZD refers to an address suitable for the	\
@@ -223,14 +272,82 @@ extern "C" {
 
 	// LO/HI registers
 
+	/// @brief Construct a 'lohi_state_t' with the current values of the LO/HI registers.
+	/// 
+	/// Optional, provided as a way of accessing those registers without first setting values.
+	/// Obtained values are unspecified. They depend on preceding code and can change depending
+	/// on compiler optimization.
+	/// 
+	/// This function reads global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
+	FORCEINLINE REPRODUCIBLE void lohi_state_construct(lohi_state_t* state)
+	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+#else
+		asm volatile(	/* must be volatile so gcc cannot assume the values are always the same	*/
+			"pmflo	%[Lo0]\n\t"
+			"pmfhi	%[Hi0]\n\t"
+			"pcpyud	%[Lo1],%[Lo0],%[Lo0]\n\t"
+			"pcpyud	%[Hi1],%[Hi0],%[Hi0]"
+			: [Lo0] "=r" (state->lo[0]),									/* output operands	*/
+			  [Lo1] "=r" (state->lo[1]),
+			  [Hi0] "=r" (state->hi[0]),
+			  [Hi1] "=r" (state->hi[1])
+		);
+#endif
+	}
+
+	/// @brief Destroy a 'lohi_state_t' by writing back the contained values to the LO/HI
+	/// registers.
+	/// 
+	/// Optional, provided as a way of accessing those registers while affecting global state.
+	/// Effect of written vales is unspecified and depends on following code. Can change depending
+	/// on compiler optimizations.
+	/// 
+	/// This function writes global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
+	FORCEINLINE void lohi_state_destruct(lohi_state_t* state)
+	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+#else
+		asm volatile(			/* must be volatile so gcc cannot discard an unused store	*/
+			"pcpyld	%[Lo0],%[Lo1],%[Lo0]\n\t"
+			"pcpyld	%[Hi0],%[Hi1],%[Hi0]\n\t"
+			"pmtlo	%[Lo0]\n\t"
+			"pmthi	%[Hi0]"
+			:															/* output operands	*/
+			: [Lo0] "r" (state->lo[0]),									/* input opoerands	*/
+			  [Lo1] "r" (state->lo[1]),
+			  [Hi0] "r" (state->hi[0]),
+			  [Hi1] "r" (state->hi[1])
+			: "lo", "hi"														/* clobbers	*/
+		);
+#endif
+	}
+
 	/// @brief MTLO : Move To LO register
 	/// 
 	/// Set LO0 to 0.
 	/// 
 	/// This function writes to global state (LO0).
-	FORCEINLINE void setzero_lo0()
+	/// @param state Additional state used in safe mode. May not be NULL.
+	FORCEINLINE void setzero_lo0(lohi_state_t* state)
 	{
-		asm("mtlo $0");
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
+		// implicitly volatile
+		asm(
+			"mtlo	$0"
+			:										/* output operands	*/
+			:										/* input operands	*/
+			: "lo"									/* clobbers lo register	*/
+		);
+#else
+		state->lo[0] = 0;
+#endif
 	}
 
 	/// @brief MTHI : Move To HI register
@@ -238,9 +355,22 @@ extern "C" {
 	/// Set HI0 to 0.
 	/// 
 	/// This function writes to global state (HI0).
-	FORCEINLINE void setzero_hi0()
+	/// @param state Additional state used in safe mode. May not be NULL.
+	FORCEINLINE void setzero_hi0(lohi_state_t* state)
 	{
-		asm("mthi $0");
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
+		// implicitly volatile
+		asm(
+			"mthi	$0"
+			:										/* output operands	*/
+			:										/* input operands	*/
+			: "hi"									/* clobbers hi register	*/
+		);
+#else
+		state->hi[0] = 0;
+#endif
 	}
 
 	/// @brief MTLO1 : Move To LO1 register
@@ -248,9 +378,22 @@ extern "C" {
 	/// Set LO1 to 0.
 	/// 
 	/// This function writes to global state (LO1).
-	FORCEINLINE void setzero_lo1()
+	/// @param state Additional state used in safe mode. May not be NULL.
+	FORCEINLINE void setzero_lo1(lohi_state_t* state)
 	{
-		asm("mtlo1 $0");
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
+		// implicitly volatile
+		asm(
+			"mtlo1	$0"
+			:										/* output operands	*/
+			:										/* input operands	*/
+			: "lo"									/* clobbers lo register	*/
+		);
+#else
+		state->lo[1] = 0;
+#endif
 	}
 
 	/// @brief MTHI1 : Move To HI1 register
@@ -258,9 +401,22 @@ extern "C" {
 	/// Set HI1 to 0.
 	/// 
 	/// This function writes to global state (HI1).
-	FORCEINLINE void setzero_hi1()
+	/// @param state Additional state used in safe mode. May not be NULL.
+	FORCEINLINE void setzero_hi1(lohi_state_t* state)
 	{
-		asm("mthi1 $0");
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
+		// implicitly volatile
+		asm(
+			"mthi1	$0"
+			:										/* output operands	*/
+			:										/* input operands	*/
+			: "hi"									/* clobbers hi register	*/
+		);
+#else
+		state->hi[1] = 0;
+#endif
 	}
 
 	/// @brief MTLO : Move To LO register
@@ -269,10 +425,11 @@ extern "C" {
 	/// Set LO0 and HI0 to 0.
 	/// 
 	/// This function writes to global state (LO0/HI0).
-	FORCEINLINE void setzero_lohi0()
+	/// @param state Additional state used in safe mode. May not be NULL.
+	FORCEINLINE void setzero_lohi0(lohi_state_t* state)
 	{
-		setzero_lo0();
-		setzero_hi0();
+		setzero_lo0(state);
+		setzero_hi0(state);
 	}
 
 	/// @brief MTLO1 : Move To LO1 register
@@ -281,10 +438,11 @@ extern "C" {
 	/// Set LO1 and HI1 to 0.
 	/// 
 	/// This function writes to global state (LO1/HI1).
-	FORCEINLINE void setzero_lohi1()
+	/// @param state Additional state used in safe mode. May not be NULL.
+	FORCEINLINE void setzero_lohi1(lohi_state_t* state)
 	{
-		setzero_lo1();
-		setzero_hi1();
+		setzero_lo1(state);
+		setzero_hi1(state);
 	}
 
 
@@ -296,20 +454,27 @@ extern "C" {
 	/// not finished yet. See functions implementing 'MULT', 'MADD' and 'DIV'.
 	/// 
 	/// This function reads global state (LO0)
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return The value stored in LO0 (LO bits 0..63)
-	FORCEINLINE PURE int32_t load_lo0_32()
+	FORCEINLINE PURE int32_t load_lo0_32(lohi_state_t* state)
 	{
-		int32_t result;
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
+		int32_t result = 0;
 
 		// I'd like to tell gcc that this asm reads from the LO register but using a variable bound
 		// to the "l" constraint sets LO first and then inserts this asm after. As it stands, this
 		// needs to be declared volatile to ensure gcc doesn't think the result is always the same.
 		asm volatile(
-			"mflo %[Result]"
+			"mflo	%[Result]"
 			: [Result] "=r" (result)		// output operands
 		);
 
 		return result;
+#else
+		return (int32_t)((int64_t)state->lo[0]);	// not equivalent, this will fix the high 32 bits
+#endif
 	}
 
 	/// @brief MFLO : Move From LO register
@@ -320,20 +485,27 @@ extern "C" {
 	/// not finished yet. See functions implementing 'MULT', 'MADD' and 'DIV'.
 	/// 
 	/// This function reads global state (LO0)
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return The value stored in LO0 (LO bits 0..63)
-	FORCEINLINE PURE int64_t load_lo0_64()
+	FORCEINLINE PURE int64_t load_lo0_64(lohi_state_t* state)
 	{
-		int64_t result;
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
+		int64_t result = 0;
 
 		// I'd like to tell gcc that this asm reads from the LO register but using a variable bound
 		// to the "l" constraint sets LO first and then inserts this asm after. As it stands, this
 		// needs to be declared volatile to ensure gcc doesn't think the result is always the same.
 		asm volatile(
-			"mflo %[Result]"
+			"mflo	%[Result]"
 			: [Result] "=r" (result)		// output operands
-			);
+		);
 
 		return result;
+#else
+		return (int64_t)state->lo[0];
+#endif
 	}
 
 	/// @brief MFHI : Move From HI register
@@ -344,20 +516,27 @@ extern "C" {
 	/// not finished yet. See functions implementing 'MULT', 'MADD' and 'DIV'.
 	/// 
 	/// This function reads global state (HI0)
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return The value stored in HI0 (HI bits 0..63)
-	FORCEINLINE PURE int32_t load_hi0_32()
+	FORCEINLINE PURE int32_t load_hi0_32(lohi_state_t* state)
 	{
-		int32_t result;
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
+		int32_t result = 0;
 
 		// I'd like to tell gcc that this asm reads from the HI register but using a variable bound
 		// to the "h" constraint sets HI first and then inserts this asm after. As it stands, this
 		// needs to be declared volatile to ensure gcc doesn't think the result is always the same.
 		asm volatile(
-			"mfhi %[Result]"
+			"mfhi	%[Result]"
 			: [Result] "=r" (result)		// output operands
 		);
 
 		return result;
+#else
+		return (int32_t)((int64_t)state->hi[0]);	// not equivalent, this will fix the high 32 bits
+#endif
 	}
 
 	/// @brief MFHI : Move From HI register
@@ -368,20 +547,27 @@ extern "C" {
 	/// not finished yet. See functions implementing 'MULT', 'MADD' and 'DIV'.
 	/// 
 	/// This function reads global state (HI0)
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return The value stored in HI0 (HI bits 0..63)
-	FORCEINLINE PURE int64_t load_hi0_64()
+	FORCEINLINE PURE int64_t load_hi0_64(lohi_state_t* state)
 	{
-		int64_t result;
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
+		int64_t result = 0;
 
 		// I'd like to tell gcc that this asm reads from the HI register but using a variable bound
 		// to the "h" constraint sets HI first and then inserts this asm after. As it stands, this
 		// needs to be declared volatile to ensure gcc doesn't think the result is always the same.
 		asm volatile(
-			"mfhi %[Result]"
+			"mfhi	%[Result]"
 			: [Result] "=r" (result)		// output operands
-			);
+		);
 
 		return result;
+#else
+		return (int64_t)state->hi[0];
+#endif
 	}
 
 	/// @brief MFLO1 : Move From LO1 register
@@ -392,20 +578,27 @@ extern "C" {
 	/// not finished yet. See functions implementing 'MULT', 'MADD' and 'DIV'.
 	/// 
 	/// This function reads global state (LO1)
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return The value stored in LO1 (LO bits 64..127)
-	FORCEINLINE PURE int32_t load_lo1_32()
+	FORCEINLINE PURE int32_t load_lo1_32(lohi_state_t* state)
 	{
-		int32_t result;
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
+		int32_t result = 0;
 
 		// I'd like to tell gcc that this asm reads from the LO register but using a variable bound
 		// to the "l" constraint sets LO first and then inserts this asm after. As it stands, this
 		// needs to be declared volatile to ensure gcc doesn't think the result is always the same.
 		asm volatile(
-			"mflo1 %[Result]"
+			"mflo1	%[Result]"
 			: [Result] "=r" (result)		// output operands
 		);
 
 		return result;
+#else
+		return (int32_t)((int64_t)state->lo[1]);	// not equivalent, this will fix the high 32 bits
+#endif
 	}
 
 	/// @brief MFLO1 : Move From LO1 register
@@ -416,20 +609,27 @@ extern "C" {
 	/// not finished yet. See functions implementing 'MULT', 'MADD' and 'DIV'.
 	/// 
 	/// This function reads global state (LO1)
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return The value stored in LO1 (LO bits 64..127)
-	FORCEINLINE PURE int64_t load_lo1_64()
+	FORCEINLINE PURE int64_t load_lo1_64(lohi_state_t* state)
 	{
-		int64_t result;
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
+		int64_t result = 0;
 
 		// I'd like to tell gcc that this asm reads from the LO register but using a variable bound
 		// to the "l" constraint sets LO first and then inserts this asm after. As it stands, this
 		// needs to be declared volatile to ensure gcc doesn't think the result is always the same.
 		asm volatile(
-			"mflo1 %[Result]"
+			"mflo1	%[Result]"
 			: [Result] "=r" (result)		// output operands
-			);
+		);
 
 		return result;
+#else
+		return (int64_t)state->lo[1];
+#endif
 	}
 
 	/// @brief MFHI1 : Move From HI1 register
@@ -440,20 +640,27 @@ extern "C" {
 	/// not finished yet. See functions implementing 'MULT', 'MADD' and 'DIV'.
 	/// 
 	/// This function reads global state (HI1)
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return The value stored in HI1 (HI bits 64..127)
-	FORCEINLINE PURE int32_t load_hi1_32()
+	FORCEINLINE PURE int32_t load_hi1_32(lohi_state_t* state)
 	{
-		int32_t result;
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
+		int32_t result = 0;
 
 		// I'd like to tell gcc that this asm reads from the HI register but using a variable bound
 		// to the "h" constraint sets HI first and then inserts this asm after. As it stands, this
 		// needs to be declared volatile to ensure gcc doesn't think the result is always the same.
 		asm volatile(
-			"mfhi1 %[Result]"
+			"mfhi1	%[Result]"
 			: [Result] "=r" (result)		// output operands
 		);
 
 		return result;
+#else
+		return (int32_t)((int64_t)state->hi[1]);	// not equivalent, this will fix the high 32 bits
+#endif
 	}
 
 	/// @brief MFHI1 : Move From HI1 register
@@ -464,20 +671,27 @@ extern "C" {
 	/// not finished yet. See functions implementing 'MULT', 'MADD' and 'DIV'.
 	/// 
 	/// This function reads global state (HI1)
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return The value stored in HI1 (HI bits 64..127)
-	FORCEINLINE PURE int64_t load_hi1_64()
+	FORCEINLINE PURE int64_t load_hi1_64(lohi_state_t* state)
 	{
-		int64_t result;
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
+		int64_t result = 0;
 
 		// I'd like to tell gcc that this asm reads from the HI register but using a variable bound
 		// to the "h" constraint sets HI first and then inserts this asm after. As it stands, this
 		// needs to be declared volatile to ensure gcc doesn't think the result is always the same.
 		asm volatile(
-			"mfhi1 %[Result]"
+			"mfhi1	%[Result]"
 			: [Result] "=r" (result)		// output operands
-			);
+		);
 
 		return result;
+#else
+		return (int64_t)state->hi[1];
+#endif
 	}
 
 	/// @brief MFLO : Move From LO register
@@ -490,12 +704,13 @@ extern "C" {
 	/// not finished yet. See functions implementing 'MULT', 'MADD' and 'DIV'.
 	/// 
 	/// This function reads global state (LO0/HI0)
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return Concatenated LO and HI register values
-	FORCEINLINE PURE int64_t load_lohi0_32()
+	FORCEINLINE PURE int64_t load_lohi0_32(lohi_state_t* state)
 	{
-		int64_t result = load_hi0_32();
+		int64_t result = load_hi0_32(state);
 		result <<= 32;
-		result |= load_lo0_32();
+		result |= load_lo0_32(state);
 		return result;
 	}
 
@@ -509,12 +724,13 @@ extern "C" {
 	/// not finished yet. See functions implementing 'MULT', 'MADD' and 'DIV'.
 	/// 
 	/// This function reads global state (LO1/HI1)
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return Concatenated LO and HI register values
-	FORCEINLINE PURE int64_t load_lohi1_32()
+	FORCEINLINE PURE int64_t load_lohi1_32(lohi_state_t* state)
 	{
-		int64_t result = load_hi1_32();
+		int64_t result = load_hi1_32(state);
 		result <<= 32;
-		result |= load_lo1_32();
+		result |= load_lo1_32(state);
 		return result;
 	}
 
@@ -524,17 +740,25 @@ extern "C" {
 	/// Store a value to the LO0 register.
 	/// 
 	/// This function writes to global state (LO0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param value Value to store in LO0 (LO bits 0..63)
-	FORCEINLINE void store_lo0(int64_t value)
+	FORCEINLINE void store_lo0(lohi_state_t* state, int64_t value)
 	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
 		// I'd like to tell gcc that this asm writes to the LO register but using a variable bound
 		// to the "l" constraint will not be used, discarding the asm statement. As it stands, this
 		// needs to be declared volatile to ensure gcc doesn't think the store is unobserved.
-		asm volatile(					// already implicitly volatile due to no output operand
-			"mtlo %[Value]"
+		asm volatile(					// would be implicitly volatile
+			"mtlo	%[Value]"
 			:							// output operands
 			: [Value] "r" (value)		// input operands
+			: "lo"						// clobbers
 		);
+#else
+		state->lo[0] = value;
+#endif
 	}
 
 	/// @brief MTHI : Move To HI register
@@ -542,17 +766,25 @@ extern "C" {
 	/// Store a value to the HI0 register.
 	/// 
 	/// This function writes to global state (HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param value Value to store in HI0 (HI bits 0..63)
-	FORCEINLINE void store_hi0(int64_t value)
+	FORCEINLINE void store_hi0(lohi_state_t* state, int64_t value)
 	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
 		// I'd like to tell gcc that this asm writes to the HI register but using a variable bound
 		// to the "h" constraint will not be used, discarding the asm statement. As it stands, this
 		// needs to be declared volatile to ensure gcc doesn't think the store is unobserved.
-		asm volatile(					// already implicitly volatile due to no output operand
-			"mthi %[Value]"
+		asm volatile(					// would be implicitly volatile
+			"mthi	%[Value]"
 			:							// output operands
 			: [Value] "r" (value)		// input operands
+			: "hi"						// clobbers
 		);
+#else
+		state->hi[0] = value;
+#endif
 	}
 
 	/// @brief MTLO1 : Move To LO1 register
@@ -560,17 +792,25 @@ extern "C" {
 	/// Store a value to the LO1 register.
 	/// 
 	/// This function writes to global state (LO1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param value Value to store in LO1 (LO bits 64..127)
-	FORCEINLINE void store_lo1(int64_t value)
+	FORCEINLINE void store_lo1(lohi_state_t* state, int64_t value)
 	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
 		// I'd like to tell gcc that this asm writes to the LO register but using a variable bound
 		// to the "l" constraint will not be used, discarding the asm statement. As it stands, this
 		// needs to be declared volatile to ensure gcc doesn't think the store is unobserved.
-		asm volatile(					// already implicitly volatile due to no output operand
-			"mtlo1 %[Value]"
+		asm volatile(					// would be implicitly volatile
+			"mtlo1	%[Value]"
 			:							// output operands
 			: [Value] "r" (value)		// input operands
+			: "lo"						// clobbers
 		);
+#else
+		state->lo[1] = value;
+#endif
 	}
 
 	/// @brief MTHI1 : Move To HI1 register
@@ -578,21 +818,69 @@ extern "C" {
 	/// Store a value to the HI1 register.
 	/// 
 	/// This function writes to global state (HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param value Value to store in HI1 (HI bits 64..127)
-	FORCEINLINE void store_hi1(int64_t value)
+	FORCEINLINE void store_hi1(lohi_state_t* state, int64_t value)
 	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
 		// I'd like to tell gcc that this asm writes to the HI register but using a variable bound
 		// to the "h" constraint will not be used, discarding the asm statement. As it stands, this
 		// needs to be declared volatile to ensure gcc doesn't think the store is unobserved.
-		asm volatile(					// already implicitly volatile due to no output operand
-			"mthi1 %[Value]"
+		asm volatile(					// would be implicitly volatile
+			"mthi1	%[Value]"
 			:							// output operands
 			: [Value] "r" (value)		// input operands
+			: "hi"						// clobbers
 		);
+#else
+		state->hi[1] = value;
+#endif
 	}
 
 	
 	// Funnel Shift
+
+	/// @brief Construct a 'sa_state_t' using the value currently stored in the SA register.
+	/// 
+	/// Optional, provided as means of accessing that register without first setting a value.
+	/// Obtained value is unspecified and depends on preceding code.
+	/// 
+	/// This function reads global state (SA).
+	/// @param state Additional state used in safe mode. May not be NULL.
+	FORCEINLINE REPRODUCIBLE void sa_state_construct(sa_state_t* state)
+	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+#else
+		asm volatile( /* must be volatile so gcc cannot assume the result is always the same	*/
+			"mfsa	%[Value]"
+			: [Value] "=r" (state->sa)										/* output operands	*/
+		);
+#endif
+	}
+
+	/// @brief Destroy a 'sa_state_t' by writing the value currently stored to the SA register.
+	/// 
+	/// Optional, provided as means of writing globally to that register. Effect of written
+	/// value is unspecified and depends on following code.
+	/// 
+	/// This function writes to global state (SA).
+	/// @param state Additional state used in safe mode. May not be NULL.
+	FORCEINLINE void sa_state_destruct(sa_state_t* state)
+	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+#else
+		asm volatile(		/* must be volatile so gcc cannot assume the store is unobserved	*/
+			"mtsa	%[Value]"
+			:																/* output operands	*/
+			: [Value] "r" (state->sa)										/* input operands	*/
+			: /*"sa"*/																/* clobbers	*/
+		);
+#endif
+	}
 
 	/// @brief MFSA : Move From Shift Amount register
 	/// 
@@ -603,22 +891,29 @@ extern "C" {
 	/// particular value. Set the shift amount register to a meaningful value by using 'set_sa_8'
 	/// or 'set_sa_16'.
 	/// 
-	/// This function reads global state (SA)
+	/// This function reads global state (SA).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return The value stored in SA (SA bits 0..63)
-	FORCEINLINE PURE uint64_t load_sa()
+	FORCEINLINE PURE uint64_t load_sa(sa_state_t* state)
 	{
-		uint64_t result;
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
+		uint64_t result = 0;
 
 		// I'd like to tell gcc that this asm reads from the SA register but I don't know of any
 		// constraint that fixes a variable to that register, much less how to use it here (see
-		// other load_lo/hi functions. As it stands, this needs to be declared volatile to ensure
+		// other load_lo/hi functions). As it stands, this needs to be declared volatile to ensure
 		// gcc doesn't think the result is always the same.
 		asm volatile(
-			"mfsa %[Result]"
+			"mfsa	%[Result]"
 			: [Result] "=r" (result)		// output operands
-			);
+		);
 
 		return result;
+#else
+		return state->sa;
+#endif
 	}
 
 	/// @brief MTSA : Move To Shift Amount register
@@ -630,21 +925,34 @@ extern "C" {
 	/// particular value. Set the shift amount register to a meaningful value by using 'set_sa_8'
 	/// or 'set_sa_16'.
 	/// 
+	/// Note that the 3 preceding instructions may not be any of the following:
+	/// MFSA, MTSAB, MTSAH, QFSRV
+	/// 
 	/// This function writes to global state (SA).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param value Value to store in SA
-	FORCEINLINE void store_sa(uint64_t value)
+	FORCEINLINE void store_sa(sa_state_t* state, uint64_t value)
 	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
 		// I'd like to tell gcc that this asm writes to the SA register but I don't know of any
 		// constraint that fixes a variable to that register, much less how to use it here (see
 		// 'load_sa'). As it stands, this needs to be declared volatile to ensure gcc doesn't think
-		// the write is unobserved.
+		// the write is unobserved (and would be implicitly).
 		asm volatile(
-			"mtsa %[Value]"
-			:							// output operands	need to figure out which constraint means SA register, i hope S works...
+			"mtsa	%[Value]"
+			:							// output operands
 			: [Value] "r" (value)		// input operands
+			: /*"sa"*/					// clobbers
 		);
+#else
+		state->sa = value;
+#endif
 	}
 
+	// MTSAB_BOTH
+#ifdef PS2INTRIN_UNSAFE
 	/// @brief MTSAB : Move byte count To Shift Amount register (Byte)
 	/// 
 	/// Set a byte shift count in the shift amount register.
@@ -659,18 +967,69 @@ extern "C" {
 	/// instruction. Otherwise, prefer 'MTSAB_IMMEDIATE' if you only have a constant value and
 	/// 'set_sa_8' if you only have a variable shift amount.
 	/// 
+	/// Note that the 3 preceding instructions may not be any of the following:
+	/// MFSA, QFSRV
+	/// 
 	/// This macro writes to global state (SA).
+	/// @param state Additional state used in safe mode. Must be an expression of type
+	/// 'sa_state_t*'. May not be NULL.
 	/// @param variable The variable byte-amount to set up the shift amount register for. Should be
 	/// the name of a variable of type 'unsigned'.
 	/// @param immediate The compile time constant byte-amount to set up the shift amount register
 	/// for. Should be an integer literal.
-#define MTSAB_BOTH(variable, immediate)																\
+	#define MTSAB_BOTH(state, variable, immediate)													\
+	{																								\
+		(void)(state);																				\
 		asm volatile(									/*	volatile, same reason as 'store_sa'	*/	\
-			"mtsab %[Variable],%c[Immediate]"														\
+			"mtsab	%[Variable],%c[Immediate]"														\
 			:															/*	output parameters	*/	\
 			: [Variable] "r" (variable), [Immediate] "n" (immediate)	/*	input parameters	*/	\
-		)
+			: /*"sa"*/													/*	clobbers	*/			\
+		);																							\
+	}
+#else
+	/// @brief MTSAB : Move byte count To Shift Amount register (Byte)
+	/// 
+	/// Set a byte shift count in the shift amount register.
+	/// 
+	/// The values of 'variable' and 'immediate' are XOR'ed together. The resulting value is the
+	/// amount of bytes 'byte_shift_logical_right' will shift by.
+	/// 
+	/// Allowable values for 'variable' and 'immediate' are [0,15]. Only the lower 4 bits are used,
+	/// others are ignored.
+	/// 
+	/// Use this macro if you require both the variable and constant values usable by the 'mtsab'
+	/// instruction. Otherwise, prefer 'MTSAB_IMMEDIATE' if you only have a constant value and
+	/// 'set_sa_8' if you only have a variable shift amount.
+	/// 
+	/// Note that the 3 preceding instructions may not be any of the following:
+	/// MFSA, QFSRV
+	/// 
+	/// This macro writes to global state (SA).
+	/// @param state Additional state used in safe mode. Must be an expression of type
+	/// 'sa_state_t*'. May not be NULL.
+	/// @param variable The variable byte-amount to set up the shift amount register for. Should be
+	/// the name of a variable of type 'unsigned'.
+	/// @param immediate The compile time constant byte-amount to set up the shift amount register
+	/// for. Should be an integer literal.
+	#define MTSAB_BOTH(state, variable, immediate)													\
+	{																								\
+		uint64_t result = 0;																		\
+		uint64_t tmp = 0;																			\
+		asm volatile(																				\
+			"mfsa	%[Tmp]\n\t"																		\
+			"nop\n\tnop\n\tnop\n\tmtsab	%[Variable],%c[Immediate]\n\t"	/*	timing nops	*/			\
+			"mfsa	%[Result]\n\t"																	\
+			"nop\n\tnop\n\tnop\n\tmtsa	%[Tmp]\n\t"						/*	timing nops	*/			\
+			: [Result] "=r" (result), [Tmp] "=&r" (tmp)					/*	output parameters	*/	\
+			: [Variable] "r" (variable), [Immediate] "n" (immediate)	/*	input parameters	*/	\
+		);																							\
+		(state)->sa = result;																		\
+	}
+#endif
 
+	// MTSAB_IMMEDIATE
+#ifdef PS2INTRIN_UNSAFE
 	/// @brief MTSAB : Move byte count To Shift Amount register (Byte)
 	/// 
 	/// Set a byte shift count in the shift amount register.
@@ -683,15 +1042,60 @@ extern "C" {
 	/// Use this macro if your shift amount is known at compile time. Using this macro does not use
 	/// a general purpose register. Otherwise, prefer 'MTSAB_BOTH' or 'set_sa_8'.
 	/// 
+	/// Note that the 3 preceding instructions may not be any of the following:
+	/// MFSA, QFSRV
+	/// 
 	/// This macro writes to global state (SA).
+	/// @param state Additional state used in safe mode. Must be an expression of type
+	/// 'sa_state_t*'. May not be NULL.
 	/// @param immediate The compile time constant byte-amount to set up the shift amount register
 	/// for. Should be an integer literal.
-#define MTSAB_IMMEDIATE(immediate)																	\
+	#define MTSAB_IMMEDIATE(state, immediate)														\
+	{																								\
+		(void)state;																				\
 		asm volatile(									/*	volatile, same reason as 'store_sa'	*/	\
-			"mtsab $0,%c[Immediate]"																\
+			"mtsab	$0,%c[Immediate]"																\
 			:															/*	output parameters	*/	\
 			: [Immediate] "n" (immediate)								/*	input parameters	*/	\
-		)
+			: /*"sa"*/													/*	clobbers	*/			\
+		);																							\
+	}
+#else
+	/// @brief MTSAB : Move byte count To Shift Amount register (Byte)
+	/// 
+	/// Set a byte shift count in the shift amount register.
+	/// 
+	/// The 'immediate' value is the amount of bytes 'byte_shift_logical_right' will shift by.
+	/// 
+	/// Allowable values for 'immediate' are [0,15]. Only the lower 4 bits are used, others are
+	/// ignored.
+	/// 
+	/// Use this macro if your shift amount is known at compile time. Using this macro does not use
+	/// a general purpose register. Otherwise, prefer 'MTSAB_BOTH' or 'set_sa_8'.
+	/// 
+	/// Note that the 3 preceding instructions may not be any of the following:
+	/// MFSA, QFSRV
+	/// 
+	/// This macro writes to global state (SA).
+	/// @param state Additional state used in safe mode. Must be an expression of type
+	/// 'sa_state_t*'. May not be NULL.
+	/// @param immediate The compile time constant byte-amount to set up the shift amount register
+	/// for. Should be an integer literal.
+#define MTSAB_IMMEDIATE(state, immediate)															\
+	{																								\
+		uint64_t result = 0;																		\
+		uint64_t tmp = 0;																			\
+		asm volatile(																				\
+			"mfsa	%[Tmp]\n\t"																		\
+			"nop\n\tnop\n\tnop\n\tmtsab	$0,%c[Immediate]\n\t"			/*	timing nops	*/			\
+			"mfsa	%[Result]\n\t"																	\
+			"nop\n\tnop\n\tnop\n\tmtsa	%[Tmp]\n\t"						/*	timing nops	*/			\
+			: [Result] "=r" (result), [Tmp] "=&r" (tmp)					/*	output parameters	*/	\
+			: [Immediate] "n" (immediate)								/*	input parameters	*/	\
+		);																							\
+		(state)->sa = result;																		\
+	}
+#endif
 
 	/// @brief MTSAB : Move byte count To Shift Amount register (Byte)
 	/// 
@@ -703,13 +1107,19 @@ extern "C" {
 	/// Use this function if your byte shift amount is calculated by the program. Otherwise, prefer
 	/// 'MTSAB_BOTH' or 'MTSAB_IMMEDIATE'.
 	/// 
+	/// Note that the 3 preceding instructions may not be any of the following:
+	/// MFSA, QFSRV
+	/// 
 	/// This function writes to global state (SA).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param byte_amount The byte-amount to set up the shift amount register for.
-	FORCEINLINE void set_sa_8(unsigned byte_amount)
+	FORCEINLINE void set_sa_8(sa_state_t* state, unsigned byte_amount)
 	{
-		MTSAB_BOTH(byte_amount, 0);
+		MTSAB_BOTH(state, byte_amount, 0);
 	}
 
+	// MTSAH_BOTH
+#ifdef PS2INTRIN_UNSAFE
 	/// @brief MTSAH : Move halfword count To Shift Amount register (Halfword)
 	/// 
 	/// Set a halfword shift count in the shift amount register.
@@ -724,18 +1134,69 @@ extern "C" {
 	/// instruction. Otherwise, prefer 'MTSAH_IMMEDIATE' if you only have a constant value and
 	/// 'set_sa_16' if you only have a variable shift amount.
 	/// 
+	/// Note that the 3 preceding instructions may not be any of the following:
+	/// MFSA, QFSRV
+	/// 
 	/// This macro writes to global state (SA).
+	/// @param state Additional state used in safe mode. Must be an expression of type
+	/// 'sa_state_t*'. May not be NULL.
 	/// @param variable The variable halfword-amount to set up the shift amount register for. Should be
 	/// the name of a variable of type 'unsigned'.
 	/// @param immediate The compile time constant halfword-amount to set up the shift amount register
 	/// for. Should be an integer literal.
-#define MTSAH_BOTH(variable, immediate)																\
+	#define MTSAH_BOTH(state, variable, immediate)													\
+	{																								\
+		(void)state;																				\
 		asm volatile(									/*	volatile, same reason as 'store_sa'	*/	\
-			"mtsah %[Variable],%c[Immediate]"														\
+			"mtsah	%[Variable],%c[Immediate]"														\
 			:															/*	output parameters	*/	\
 			: [Variable] "r" (variable), [Immediate] "n" (immediate)	/*	input parameters	*/	\
-		)
+			: /*"sa"*/													/*	clobbers	*/			\
+		);																							\
+	}
+#else
+	/// @brief MTSAH : Move halfword count To Shift Amount register (Halfword)
+	/// 
+	/// Set a halfword shift count in the shift amount register.
+	/// 
+	/// The values of 'variable' and 'immediate' are XOR'ed together. The resulting value is the
+	/// amount of halfwords 'byte_shift_logical_right' will shift by.
+	/// 
+	/// Allowable values for 'variable' and 'immediate' are [0,7]. Only the lower 3 bits are used,
+	/// others are ignored.
+	/// 
+	/// Use this macro if you require both the variable and constant values usable by the 'mtsah'
+	/// instruction. Otherwise, prefer 'MTSAH_IMMEDIATE' if you only have a constant value and
+	/// 'set_sa_16' if you only have a variable shift amount.
+	/// 
+	/// Note that the 3 preceding instructions may not be any of the following:
+	/// MFSA, QFSRV
+	/// 
+	/// This macro writes to global state (SA).
+	/// @param state Additional state used in safe mode. Must be an expression of type
+	/// 'sa_state_t*'. May not be NULL.
+	/// @param variable The variable halfword-amount to set up the shift amount register for. Should be
+	/// the name of a variable of type 'unsigned'.
+	/// @param immediate The compile time constant halfword-amount to set up the shift amount register
+	/// for. Should be an integer literal.
+	#define MTSAH_BOTH(state, variable, immediate)													\
+	{																								\
+		uint64_t result = 0;																		\
+		uint64_t tmp = 0;																			\
+		asm volatile(																				\
+			"mfsa	%[Tmp]\n\t"																		\
+			"nop\n\tnop\n\tnop\n\tmtsah	%[Variable],%c[Immediate]\n\t"	/*	timing nops	*/			\
+			"mfsa	%[Result]\n\t"																	\
+			"nop\n\tnop\n\tnop\n\tmtsa	%[Tmp]\n\t"						/*	timing nops	*/			\
+			: [Result] "=r" (result), [Tmp] "=&r" (tmp)					/*	output parameters	*/	\
+			: [Variable] "r" (variable), [Immediate] "n" (immediate)	/*	input parameters	*/	\
+		);																							\
+		(state)->sa = result;																		\
+	}
+#endif
 
+	// MTSAH_IMMEDIATE
+#ifdef PS2INTRIN_UNSAFE
 	/// @brief MTSAH : Move halfword count To Shift Amount register (Halfword)
 	/// 
 	/// Set a halfword shift count in the shift amount register.
@@ -748,15 +1209,60 @@ extern "C" {
 	/// Use this macro if your shift amount is known at compile time. Using this macro does not use
 	/// a general purpose register. Otherwise, prefer 'MTSAH_BOTH' or 'set_sa_16'.
 	/// 
+	/// Note that the 3 preceding instructions may not be any of the following:
+	/// MFSA, QFSRV
+	/// 
 	/// This macro writes to global state (SA).
+	/// @param state Additional state used in safe mode. Must be an expression of type
+	/// 'sa_state_t*'. May not be NULL.
 	/// @param immediate The compile time constant halfword-amount to set up the shift amount register
 	/// for. Should be an integer literal.
-#define MTSAH_IMMEDIATE(immediate)																	\
+	#define MTSAH_IMMEDIATE(state, immediate)														\
+	{																								\
+		(void)state;																				\
 		asm volatile(									/*	volatile, same reason as 'store_sa'	*/	\
-			"mtsah $0,%c[Immediate]"																\
+			"mtsah	$0,%c[Immediate]"																\
 			:															/*	output parameters	*/	\
 			: [Immediate] "n" (immediate)								/*	input parameters	*/	\
-		)
+			: /*"sa"*/													/*	clobbers	*/			\
+		);																							\
+	}
+#else
+	/// @brief MTSAH : Move halfword count To Shift Amount register (Halfword)
+	/// 
+	/// Set a halfword shift count in the shift amount register.
+	/// 
+	/// The 'immediate' value is the amount of halfwords 'byte_shift_logical_right' will shift by.
+	/// 
+	/// Allowable values for 'immediate' are [0,7]. Only the lower 3 bits are used, others are
+	/// ignored.
+	/// 
+	/// Use this macro if your shift amount is known at compile time. Using this macro does not use
+	/// a general purpose register. Otherwise, prefer 'MTSAH_BOTH' or 'set_sa_16'.
+	/// 
+	/// Note that the 3 preceding instructions may not be any of the following:
+	/// MFSA, QFSRV
+	/// 
+	/// This macro writes to global state (SA).
+	/// @param state Additional state used in safe mode. Must be an expression of type
+	/// 'sa_state_t*'. May not be NULL.
+	/// @param immediate The compile time constant halfword-amount to set up the shift amount register
+	/// for. Should be an integer literal.
+	#define MTSAH_IMMEDIATE(state, immediate)														\
+	{																								\
+		uint64_t result = 0;																		\
+		uint64_t tmp = 0;																			\
+		asm volatile(																				\
+			"mfsa	%[Tmp]\n\t"																		\
+			"nop\n\tnop\n\tnop\n\tmtsah	$0,%c[Immediate]\n\t"			/*	timing nops	*/			\
+			"mfsa	%[Result]\n\t"																	\
+			"nop\n\tnop\n\tnop\n\tmtsa	%[Tmp]\n\t"						/*	timing nops	*/			\
+			: [Result] "=r" (result), [Tmp] "=&r" (tmp)					/*	output parameters	*/	\
+			: [Immediate] "n" (immediate)								/*	input parameters	*/	\
+		);																							\
+		(state)->sa = result;																		\
+	}
+#endif
 
 	/// @brief MTSAH : Move halfword count To Shift Amount register (Halfword)
 	/// 
@@ -769,10 +1275,11 @@ extern "C" {
 	/// 'MTSAH_BOTH' or 'MTSAH_IMMEDIATE'.
 	/// 
 	/// This function writes to global state (SA).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param halfword_amount The halfword-amount to set up the shift amount register for.
-	FORCEINLINE void set_sa_16(unsigned halfword_amount)
+	FORCEINLINE void set_sa_16(sa_state_t* state, unsigned halfword_amount)
 	{
-		MTSAH_BOTH(halfword_amount, 0);
+		MTSAH_BOTH(state, halfword_amount, 0);
 	}
 
 	/// @brief QFSRV : Quadword Funnel Shift Right Variable
@@ -789,23 +1296,63 @@ extern "C" {
 	/// data in the 'upper' position and '0' for 'lower'.
 	/// 
 	/// This function reads global state (SA).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param upper The upper 128 bits of the temporary value getting shifted right.
 	/// @param lower The lower 128 bits of the temporary value getting shifted right.
 	/// @return The lower 128 bits of the temporary value after shifting.
-	FORCEINLINE PURE uint128_t byte_shift_logical_right(uint128_t upper, uint128_t lower)
+	FORCEINLINE PURE uint128_t byte_shift_logical_right(sa_state_t* state, uint128_t upper, uint128_t lower)
 	{
-		uint128_t result;
+		uint64_t upperlo = upper & 0xFFFFFFFFFFFFFFFF;
+		uint64_t upperhi = (upper >> 64) & 0xFFFFFFFFFFFFFFFF;
+		uint64_t lowerlo = lower & 0xFFFFFFFFFFFFFFFF;
+		uint64_t lowerhi = (lower >> 64) & 0xFFFFFFFFFFFFFFFF;
+		uint64_t resultboth = 0;
+		uint64_t resulthi = 0;
 
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
 		asm(
-			"qfsrv %[Result],%[Upper],%[Lower]"
-			: [Result] "=r" (result)					// output operands
-			: [Upper] "r" (upper), [Lower] "r" (lower)	// input operands
+			"pcpyld	%[ResultBoth],%[UpperHi],%[UpperLo]\n\t"
+			"pcpyld	%[LowerLo],%[LowerHi],%[LowerLo]\n\t"
+			"qfsrv	%[ResultBoth],%[ResultBoth],%[LowerLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultBoth],%[ResultBoth]"
+			: [LowerLo] "=r" (lowerlo),
+			  [ResultBoth] "=r" (resultboth),
+			  [ResultHi] "=&r" (resulthi)					/* clobber leads to better codegen	*/
+			: [UpperHi] "r" (upperhi),
+			  [UpperLo] "r1" (upperlo),
+			  [LowerHi] "r" (lowerhi),
+			  "r0" (lowerlo)
 		);
+#else
+		uint64_t tmp = 0;
+		asm(
+			"mfsa	%[Tmp]\n\t"
+			"pcpyld	%[ResultBoth],%[UpperHi],%[UpperLo]\n\t"
+			"pcpyld	%[LowerLo],%[LowerHi],%[LowerLoR]\n\t"
+			"nop\n\tmtsa	%[State]\n\t"										/* timing nop	*/
+			"qfsrv	%[ResultBoth],%[ResultBoth],%[LowerLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultBoth],%[ResultBoth]\n\t"
+			"nop\n\tnop\n\tmtsa	%[Tmp]\n\t"										/* timing nops	*/
+			: [LowerLo] "=r" (lowerlo),
+			  [ResultBoth] "=r" (resultboth),
+			  [ResultHi] "=&r" (resulthi),					/* clobber leads to better codegen	*/
+			  [Tmp] "=&r" (tmp)								/* clobber needed					*/
+			: [UpperHi] "r" (upperhi),
+			  [UpperLo] "r1" (upperlo),					/* can be same register as resultboth	*/
+			  [LowerHi] "r" (lowerhi),
+			  [LowerLoR] "r0" (lowerlo),			/* can be same register as written lowerlo	*/
+			  [State] "r" (state->sa)
+		);
+#endif
 
+		uint64_t resultlo = resultboth & 0xFFFFFFFFFFFFFFFF;
+
+		uint128_t result = resulthi;
+		result <<= 64;
+		result |= resultlo;
 		return result;
 	}
-
-	// maybe put byte shift and rotate helper macros/functions using qfsrv here
 
 
 	// Asynchronous and Pipeline 1 instructions
@@ -823,20 +1370,49 @@ extern "C" {
 	/// this function.
 	/// 
 	/// This function writes to global state (LO0/HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First Multiplicand
 	/// @param b Second Multiplicand
 	/// @return Low 32 bits of the 64 bit multiplication result
-	FORCEINLINE int32_t mullo0_i32_start(int32_t a, int32_t b)
+	FORCEINLINE int32_t mullo0_i32_start(lohi_state_t* state, int32_t a, int32_t b)
 	{
-		int32_t lo;
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+		int32_t lo = 0;
 
 		asm volatile(
-			"mult %[Lo],%[A],%[B]"
+			"mult	%[Lo],%[A],%[B]"
 			: [Lo] "=r" (lo)
-			: [A] "%r" (a), [B] "r" (b)
+			: [A] "%r" (a),
+			  [B] "r" (b)
+			: "lo", "hi"
 		);
 
 		return lo;
+#else
+		int32_t lo = 0;
+		int64_t tmplo = 0;
+		int64_t tmphi = 0;
+
+		asm(
+			"mflo	%[TmpLo]\n\t"
+			"mfhi	%[TmpHi]\n\t"
+			"mult	%[Lo],%[A],%[B]\n\t"
+			"mflo	%[StateLo]\n\t"
+			"mfhi	%[StateHi]\n\t"
+			"mtlo	%[TmpLo]\n\t"
+			"mthi	%[TmpHi]"
+			: [Lo] "=r" (lo),
+			  [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [StateLo] "=r" (state->lo[0]),
+			  [StateHi] "=r" (state->hi[0])
+			: [A] "%r" (a),
+			  [B] "r" (b)
+		);
+
+		return lo;
+#endif
 	}
 
 	/// @brief MULT : MULTiply word
@@ -851,15 +1427,41 @@ extern "C" {
 	/// stall the EE Core.
 	/// 
 	/// This function writes to global state (LO0/HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First Multiplicand
 	/// @param b Second Multiplicand
-	FORCEINLINE void mulhi0_i32_start(int32_t a, int32_t b)
+	FORCEINLINE void mulhi0_i32_start(lohi_state_t* state, int32_t a, int32_t b)
 	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
 		asm volatile(
-			"mult %[A],%[B]"
+			"mult	%[A],%[B]"
 			: 
-			: [A] "%r" (a), [B] "r" (b)
+			: [A] "%r" (a),
+			  [B] "r" (b)
+			: "lo", "hi"
 		);
+#else
+		int64_t tmplo = 0;
+		int64_t tmphi = 0;
+
+		asm(
+			"mflo	%[TmpLo]\n\t"
+			"mfhi	%[TmpHi]\n\t"
+			"mult	%[A],%[B]\n\t"
+			"mflo	%[StateLo]\n\t"
+			"mfhi	%[StateHi]\n\t"
+			"mtlo	%[TmpLo]\n\t"
+			"mthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [StateLo] "=r" (state->lo[0]),
+			  [StateHi] "=r" (state->hi[0])
+			: [A] "%r" (a),
+			  [B] "r" (b)
+		);
+#endif
 	}
 
 	/// @brief MULT : MULTiply word
@@ -869,13 +1471,14 @@ extern "C" {
 	/// want the low 32 bit result after all.
 	/// 
 	/// This function reads global state (LO0/HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return Struct containing low and high 32 bits of 64-bit multiplication result
-	FORCEINLINE PURE mul_i32_result_t mul0_i32_finish()
+	FORCEINLINE PURE mul_i32_result_t mul0_i32_finish(lohi_state_t* state)
 	{
-		mul_i32_result_t result;
+		mul_i32_result_t result = { 0, 0 };
 
-		result.lo = load_lo0_32();
-		result.hi = load_hi0_32();
+		result.lo = load_lo0_32(state);
+		result.hi = load_hi0_32(state);
 
 		return result;
 	}
@@ -887,14 +1490,15 @@ extern "C" {
 	/// parts as a struct.
 	/// 
 	/// This function reads global state (HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param lo Low 32 bits of multiplication result obtained from 'mullo0_i32_start'
 	/// @return Struct containing low and high 32 bits of 64-bit multiplication result
-	FORCEINLINE PURE mul_i32_result_t mul0_i32_finish_lo(int32_t lo)
+	FORCEINLINE PURE mul_i32_result_t mul0_i32_finish_lo(lohi_state_t* state, int32_t lo)
 	{
-		mul_i32_result_t result;
+		mul_i32_result_t result = { 0, 0 };
 
 		result.lo = lo;
-		result.hi = load_hi0_32();
+		result.hi = load_hi0_32(state);
 
 		return result;
 	}
@@ -905,10 +1509,11 @@ extern "C" {
 	/// Prefer this function if you need both parts of the result separately or just the high part.
 	/// 
 	/// This function reads global state (HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return High 32 bits of 64-bit multiplication result
-	FORCEINLINE PURE int32_t mulhi0_i32_finish()
+	FORCEINLINE PURE int32_t mulhi0_i32_finish(lohi_state_t* state)
 	{
-		return load_hi0_32();
+		return load_hi0_32(state);
 	}
 
 	/// @brief MULT : MULTiply word
@@ -919,12 +1524,13 @@ extern "C" {
 	/// be optimal in regards to throughput. Refer to the documentation of 'mullo0_i32_start'.
 	/// 
 	/// This function writes to global state (LO0/HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First Multiplicand
 	/// @param b Second Multiplicand
 	/// @return Struct containing low and high 32 bits of 64-bit multiplication result
-	FORCEINLINE mul_i32_result_t mul0_i32(int32_t a, int32_t b)
+	FORCEINLINE mul_i32_result_t mul0_i32(lohi_state_t* state, int32_t a, int32_t b)
 	{
-		return mul0_i32_finish_lo(mullo0_i32_start(a, b));
+		return mul0_i32_finish_lo(state, mullo0_i32_start(state, a, b));
 	}
 
 	/// @brief MULTU : MULTiply Unsigned word
@@ -940,20 +1546,48 @@ extern "C" {
 	/// this function.
 	/// 
 	/// This function writes to global state (LO0/HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First Multiplicand
 	/// @param b Second Multiplicand
 	/// @return Low 32 bits of the 64 bit multiplication result
-	FORCEINLINE uint32_t mullo0_u32_start(uint32_t a, uint32_t b)
+	FORCEINLINE uint32_t mullo0_u32_start(lohi_state_t* state, uint32_t a, uint32_t b)
 	{
-		uint32_t lo;
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+		int32_t lo = 0;
 
 		asm volatile(
-			"multu %[Lo],%[A],%[B]"
+			"multu	%[Lo],%[A],%[B]"
 			: [Lo] "=r" (lo)
 			: [A] "%r" (a), [B] "r" (b)
+			: "lo", "hi"
 		);
 
 		return lo;
+#else
+		int32_t lo = 0;
+		int64_t tmplo = 0;
+		int64_t tmphi = 0;
+
+		asm(
+			"mflo	%[TmpLo]\n\t"
+			"mfhi	%[TmpHi]\n\t"
+			"multu	%[Lo],%[A],%[B]\n\t"
+			"mflo	%[StateLo]\n\t"
+			"mfhi	%[StateHi]\n\t"
+			"mtlo	%[TmpLo]\n\t"
+			"mthi	%[TmpHi]"
+			: [Lo] "=r" (lo),
+			  [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [StateLo] "=r" (state->lo[0]),
+			  [StateHi] "=r" (state->hi[0])
+			: [A] "%r" (a),
+			  [B] "r" (b)
+		);
+
+		return lo;
+#endif
 	}
 
 	/// @brief MULTU : MULTiply Unsigned word
@@ -968,15 +1602,41 @@ extern "C" {
 	/// stall the EE Core.
 	/// 
 	/// This function writes to global state (LO0/HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First Multiplicand
 	/// @param b Second Multiplicand
-	FORCEINLINE void mulhi0_u32_start(uint32_t a, uint32_t b)
+	FORCEINLINE void mulhi0_u32_start(lohi_state_t* state, uint32_t a, uint32_t b)
 	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
 		asm volatile(
-			"multu %[A],%[B]"
+			"multu	%[A],%[B]"
 			:
-			: [A] "%r" (a), [B] "r" (b)
+			: [A] "%r" (a),
+			  [B] "r" (b)
+			: "lo", "hi"
 		);
+#else
+		int64_t tmplo = 0;
+		int64_t tmphi = 0;
+
+		asm(
+			"mflo	%[TmpLo]\n\t"
+			"mfhi	%[TmpHi]\n\t"
+			"multu	%[A],%[B]\n\t"
+			"mflo	%[StateLo]\n\t"
+			"mfhi	%[StateHi]\n\t"
+			"mtlo	%[TmpLo]\n\t"
+			"mthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [StateLo] "=r" (state->lo[0]),
+			  [StateHi] "=r" (state->hi[0])
+			: [A] "%r" (a),
+			  [B] "r" (b)
+		);
+#endif
 	}
 
 	/// @brief MULTU : MULTiply Unsigned word
@@ -986,13 +1646,14 @@ extern "C" {
 	/// want the low 32 bit result after all.
 	/// 
 	/// This function reads global state (LO0/HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return Struct containing low and high 32 bits of 64-bit multiplication result
-	FORCEINLINE PURE mul_u32_result_t mul0_u32_finish()
+	FORCEINLINE PURE mul_u32_result_t mul0_u32_finish(lohi_state_t* state)
 	{
-		mul_u32_result_t result;
+		mul_u32_result_t result = { 0, 0 };
 
-		result.lo = load_lo0_32();
-		result.hi = load_hi0_32();
+		result.lo = load_lo0_32(state);
+		result.hi = load_hi0_32(state);
 
 		return result;
 	}
@@ -1004,14 +1665,15 @@ extern "C" {
 	/// parts as a struct.
 	/// 
 	/// This function reads global state (HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param lo Low 32 bits of multiplication result obtained from 'mullo0_u32_start'
 	/// @return Struct containing low and high 32 bits of 64-bit multiplication result
-	FORCEINLINE PURE mul_u32_result_t mul0_u32_finish_lo(uint32_t lo)
+	FORCEINLINE PURE mul_u32_result_t mul0_u32_finish_lo(lohi_state_t* state, uint32_t lo)
 	{
-		mul_u32_result_t result;
+		mul_u32_result_t result = { 0, 0 };
 
 		result.lo = lo;
-		result.hi = load_hi0_32();
+		result.hi = load_hi0_32(state);
 
 		return result;
 	}
@@ -1022,10 +1684,11 @@ extern "C" {
 	/// Prefer this function if you need both parts of the result separately or just the high part.
 	/// 
 	/// This function reads global state (HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return High 32 bits of 64-bit multiplication result
-	FORCEINLINE PURE uint32_t mulhi0_u32_finish()
+	FORCEINLINE PURE uint32_t mulhi0_u32_finish(lohi_state_t* state)
 	{
-		return load_hi0_32();
+		return load_hi0_32(state);
 	}
 
 	/// @brief MULTU : MULTiply Unsigned word
@@ -1036,12 +1699,13 @@ extern "C" {
 	/// be optimal in regards to throughput. Refer to the documentation of 'mullo0_u32_start'.
 	/// 
 	/// This function writes to global state (LO0/HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First Multiplicand
 	/// @param b Second Multiplicand
 	/// @return Struct containing low and high 32 bits of 64-bit multiplication result
-	FORCEINLINE mul_u32_result_t mul0_u32(uint32_t a, uint32_t b)
+	FORCEINLINE mul_u32_result_t mul0_u32(lohi_state_t* state, uint32_t a, uint32_t b)
 	{
-		return mul0_u32_finish_lo(mullo0_u32_start(a, b));
+		return mul0_u32_finish_lo(state, mullo0_u32_start(state, a, b));
 	}
 
 	/// @brief MULT1 : MULTiply word pipeline 1
@@ -1057,20 +1721,49 @@ extern "C" {
 	/// this function.
 	/// 
 	/// This function writes to global state (LO1/HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First Multiplicand
 	/// @param b Second Multiplicand
 	/// @return Low 32 bits of the 64 bit multiplication result
-	FORCEINLINE int32_t mullo1_i32_start(int32_t a, int32_t b)
+	FORCEINLINE int32_t mullo1_i32_start(lohi_state_t* state, int32_t a, int32_t b)
 	{
-		int32_t lo;
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+		int32_t lo = 0;
 
 		asm volatile(
-			"mult1 %[Lo],%[A],%[B]"
+			"mult1	%[Lo],%[A],%[B]"
 			: [Lo] "=r" (lo)
-			: [A] "%r" (a), [B] "r" (b)
+			: [A] "%r" (a),
+			  [B] "r" (b)
+			: "lo", "hi"
 		);
 
 		return lo;
+#else
+		int32_t lo = 0;
+		int64_t tmplo = 0;
+		int64_t tmphi = 0;
+
+		asm(
+			"mflo1	%[TmpLo]\n\t"
+			"mfhi1	%[TmpHi]\n\t"
+			"mult1	%[Lo],%[A],%[B]\n\t"
+			"mflo1	%[StateLo]\n\t"
+			"mfhi1	%[StateHi]\n\t"
+			"mtlo1	%[TmpLo]\n\t"
+			"mthi1	%[TmpHi]"
+			: [Lo] "=r" (lo),
+			  [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [StateLo] "=r" (state->lo[1]),
+			  [StateHi] "=r" (state->hi[1])
+			: [A] "%r" (a),
+			  [B] "r" (b)
+		);
+
+		return lo;
+#endif
 	}
 
 	/// @brief MULT1 : MULTiply word pipeline 1
@@ -1085,15 +1778,41 @@ extern "C" {
 	/// stall the EE Core.
 	/// 
 	/// This function writes to global state (LO1/HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First Multiplicand
 	/// @param b Second Multiplicand
-	FORCEINLINE void mulhi1_i32_start(int32_t a, int32_t b)
+	FORCEINLINE void mulhi1_i32_start(lohi_state_t* state, int32_t a, int32_t b)
 	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
 		asm volatile(
-			"mult1 %[A],%[B]"
+			"mult1	%[A],%[B]"
 			:
-			: [A] "%r" (a), [B] "r" (b)
+			: [A] "%r" (a),
+			  [B] "r" (b)
+			: "lo", "hi"
 		);
+#else
+		int64_t tmplo = 0;
+		int64_t tmphi = 0;
+
+		asm(
+			"mflo1	%[TmpLo]\n\t"
+			"mfhi1	%[TmpHi]\n\t"
+			"mult1	%[A],%[B]\n\t"
+			"mflo1	%[StateLo]\n\t"
+			"mfhi1	%[StateHi]\n\t"
+			"mtlo1	%[TmpLo]\n\t"
+			"mthi1	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [StateLo] "=r" (state->lo[1]),
+			  [StateHi] "=r" (state->hi[1])
+			: [A] "%r" (a),
+			  [B] "r" (b)
+		);
+#endif
 	}
 
 	/// @brief MULT : MULTiply word word pipeline 1
@@ -1103,13 +1822,14 @@ extern "C" {
 	/// want the low 32 bit result after all.
 	/// 
 	/// This function reads global state (LO1/HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return Struct containing low and high 32 bits of 64-bit multiplication result
-	FORCEINLINE PURE mul_i32_result_t mul1_i32_finish()
+	FORCEINLINE PURE mul_i32_result_t mul1_i32_finish(lohi_state_t* state)
 	{
-		mul_i32_result_t result;
+		mul_i32_result_t result = { 0, 0 };
 
-		result.lo = load_lo1_32();
-		result.hi = load_hi1_32();
+		result.lo = load_lo1_32(state);
+		result.hi = load_hi1_32(state);
 
 		return result;
 	}
@@ -1121,14 +1841,15 @@ extern "C" {
 	/// parts as a struct.
 	/// 
 	/// This function reads global state (HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param lo Low 32 bits of multiplication result obtained from 'mullo1_i32_start'
 	/// @return Struct containing low and high 32 bits of 64-bit multiplication result
-	FORCEINLINE PURE mul_i32_result_t mul1_i32_finish_lo(int32_t lo)
+	FORCEINLINE PURE mul_i32_result_t mul1_i32_finish_lo(lohi_state_t* state, int32_t lo)
 	{
-		mul_i32_result_t result;
+		mul_i32_result_t result = { 0, 0 };
 
 		result.lo = lo;
-		result.hi = load_hi1_32();
+		result.hi = load_hi1_32(state);
 
 		return result;
 	}
@@ -1139,10 +1860,11 @@ extern "C" {
 	/// Prefer this function if you need both parts of the result separately or just the high part.
 	/// 
 	/// This function reads global state (HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return High 32 bits of 64-bit multiplication result
-	FORCEINLINE PURE int32_t mulhi1_i32_finish()
+	FORCEINLINE PURE int32_t mulhi1_i32_finish(lohi_state_t* state)
 	{
-		return load_hi1_32();
+		return load_hi1_32(state);
 	}
 
 	/// @brief MULT1 : MULTiply word pipeline 1
@@ -1153,12 +1875,13 @@ extern "C" {
 	/// be optimal in regards to throughput. Refer to the documentation of 'mullo1_i32_start'.
 	/// 
 	/// This function writes to global state (LO1/HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First Multiplicand
 	/// @param b Second Multiplicand
 	/// @return Struct containing low and high 32 bits of 64-bit multiplication result
-	FORCEINLINE mul_i32_result_t mul1_i32(int32_t a, int32_t b)
+	FORCEINLINE mul_i32_result_t mul1_i32(lohi_state_t* state, int32_t a, int32_t b)
 	{
-		return mul1_i32_finish_lo(mullo1_i32_start(a, b));
+		return mul1_i32_finish_lo(state, mullo1_i32_start(state, a, b));
 	}
 
 	/// @brief MULTU1 : MULTiply Unsigned word pipeline 1
@@ -1174,20 +1897,49 @@ extern "C" {
 	/// this function.
 	/// 
 	/// This function writes to global state (LO1/HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First Multiplicand
 	/// @param b Second Multiplicand
 	/// @return Low 32 bits of the 64 bit multiplication result
-	FORCEINLINE uint32_t mullo1_u32_start(uint32_t a, uint32_t b)
+	FORCEINLINE uint32_t mullo1_u32_start(lohi_state_t* state, uint32_t a, uint32_t b)
 	{
-		uint32_t lo;
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+		int32_t lo = 0;
 
 		asm volatile(
-			"multu1 %[Lo],%[A],%[B]"
+			"multu1	%[Lo],%[A],%[B]"
 			: [Lo] "=r" (lo)
-			: [A] "%r" (a), [B] "r" (b)
+			: [A] "%r" (a),
+			  [B] "r" (b)
+			: "lo", "hi"
 		);
 
 		return lo;
+#else
+		int32_t lo = 0;
+		int64_t tmplo = 0;
+		int64_t tmphi = 0;
+
+		asm(
+			"mflo1	%[TmpLo]\n\t"
+			"mfhi1	%[TmpHi]\n\t"
+			"multu1	%[Lo],%[A],%[B]\n\t"
+			"mflo1	%[StateLo]\n\t"
+			"mfhi1	%[StateHi]\n\t"
+			"mtlo1	%[TmpLo]\n\t"
+			"mthi1	%[TmpHi]"
+			: [Lo] "=r" (lo),
+			  [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [StateLo] "=r" (state->lo[1]),
+			  [StateHi] "=r" (state->hi[1])
+			: [A] "%r" (a),
+			  [B] "r" (b)
+		);
+
+		return lo;
+#endif
 	}
 
 	/// @brief MULTU1 : MULTiply Unsigned word pipeline 1
@@ -1202,15 +1954,41 @@ extern "C" {
 	/// stall the EE Core.
 	/// 
 	/// This function writes to global state (LO1/HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First Multiplicand
 	/// @param b Second Multiplicand
-	FORCEINLINE void mulhi1_u32_start(uint32_t a, uint32_t b)
+	FORCEINLINE void mulhi1_u32_start(lohi_state_t* state, uint32_t a, uint32_t b)
 	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
 		asm volatile(
-			"multu1 %[A],%[B]"
+			"multu1	%[A],%[B]"
 			:
-			: [A] "%r" (a), [B] "r" (b)
+			: [A] "%r" (a),
+			  [B] "r" (b)
+			: "lo", "hi"
 		);
+#else
+		int64_t tmplo = 0;
+		int64_t tmphi = 0;
+
+		asm(
+			"mflo1	%[TmpLo]\n\t"
+			"mfhi1	%[TmpHi]\n\t"
+			"multu1	%[A],%[B]\n\t"
+			"mflo1	%[StateLo]\n\t"
+			"mfhi1	%[StateHi]\n\t"
+			"mtlo1	%[TmpLo]\n\t"
+			"mthi1	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [StateLo] "=r" (state->lo[1]),
+			  [StateHi] "=r" (state->hi[1])
+			: [A] "%r" (a),
+			  [B] "r" (b)
+		);
+#endif
 	}
 
 	/// @brief MULTU1 : MULTiply Unsigned word pipeline 1
@@ -1220,13 +1998,14 @@ extern "C" {
 	/// want the low 32 bit result after all.
 	/// 
 	/// This function reads global state (LO1/HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return Struct containing low and high 32 bits of 64-bit multiplication result
-	FORCEINLINE PURE mul_u32_result_t mul1_u32_finish()
+	FORCEINLINE PURE mul_u32_result_t mul1_u32_finish(lohi_state_t* state)
 	{
-		mul_u32_result_t result;
+		mul_u32_result_t result = { 0, 0 };
 
-		result.lo = load_lo1_32();
-		result.hi = load_hi1_32();
+		result.lo = load_lo1_32(state);
+		result.hi = load_hi1_32(state);
 
 		return result;
 	}
@@ -1238,14 +2017,15 @@ extern "C" {
 	/// parts as a struct.
 	/// 
 	/// This function reads global state (HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param lo Low 32 bits of multiplication result obtained from 'mullo1_u32_start'
 	/// @return Struct containing low and high 32 bits of 64-bit multiplication result
-	FORCEINLINE PURE mul_u32_result_t mul1_u32_finish_lo(uint32_t lo)
+	FORCEINLINE PURE mul_u32_result_t mul1_u32_finish_lo(lohi_state_t* state, uint32_t lo)
 	{
-		mul_u32_result_t result;
+		mul_u32_result_t result = { 0, 0 };
 
 		result.lo = lo;
-		result.hi = load_hi1_32();
+		result.hi = load_hi1_32(state);
 
 		return result;
 	}
@@ -1256,10 +2036,11 @@ extern "C" {
 	/// Prefer this function if you need both parts of the result separately or just the high part.
 	/// 
 	/// This function reads global state (HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return High 32 bits of 64-bit multiplication result
-	FORCEINLINE PURE uint32_t mulhi1_u32_finish()
+	FORCEINLINE PURE uint32_t mulhi1_u32_finish(lohi_state_t* state)
 	{
-		return load_hi1_32();
+		return load_hi1_32(state);
 	}
 
 	/// @brief MULTU1 : MULTiply Unsigned word pipeline 1
@@ -1270,12 +2051,13 @@ extern "C" {
 	/// be optimal in regards to throughput. Refer to the documentation of 'mullo1_u32_start'.
 	/// 
 	/// This function writes to global state (LO1/HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First Multiplicand
 	/// @param b Second Multiplicand
 	/// @return Struct containing low and high 32 bits of 64-bit multiplication result
-	FORCEINLINE mul_u32_result_t mul1_u32(uint32_t a, uint32_t b)
+	FORCEINLINE mul_u32_result_t mul1_u32(lohi_state_t* state, uint32_t a, uint32_t b)
 	{
-		return mul1_u32_finish_lo(mullo1_u32_start(a, b));
+		return mul1_u32_finish_lo(state, mullo1_u32_start(state, a, b));
 	}
 
 
@@ -1290,20 +2072,51 @@ extern "C" {
 	/// the return value will cause a stall if this instruction is not finished.
 	/// 
 	/// This function writes to global state (LO0/HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First multiplicand
 	/// @param b Second multiplicand
 	/// @return Low 32 bits (LO0) of the accumulator after the fused-multiply-add operation
-	FORCEINLINE int32_t fma0_i32_lo(int32_t a, int32_t b)
+	FORCEINLINE int32_t fma0_i32_lo(lohi_state_t* state, int32_t a, int32_t b)
 	{
-		int32_t lo;
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+		int32_t lo = 0;
 
 		asm volatile(
-			"madd %[Lo],%[A],%[B]"
+			"madd	%[Lo],%[A],%[B]"
 			: [Lo] "=r" (lo)
-			: [A] "%r" (a), [B] "r" (b)
+			: [A] "%r" (a),
+			  [B] "r" (b)
+			: "lo", "hi"
 		);
 
 		return lo;
+#else
+		int32_t lo = 0;
+		int64_t tmplo = 0;
+		int64_t tmphi = 0;
+
+		asm(
+			"mflo	%[TmpLo]\n\t"
+			"mfhi	%[TmpHi]\n\t"
+			"mtlo	%[StateLo]\n\t"
+			"mthi	%[StateHi]\n\t"
+			"madd	%[Lo],%[A],%[B]\n\t"
+			"mflo	%[StateLo]\n\t"
+			"mfhi	%[StateHi]\n\t"
+			"mtlo	%[TmpLo]\n\t"
+			"mthi	%[TmpHi]"
+			: [Lo] "=r" (lo),
+			  [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [StateLo] "+r" (state->lo[0]),
+			  [StateHi] "+r" (state->hi[0])
+			: [A] "%r" (a),
+			  [B] "r" (b)
+		);
+
+		return lo;
+#endif
 	}
 
 	/// @brief MADD : Multiply-ADD word
@@ -1317,15 +2130,43 @@ extern "C" {
 	/// will cause a stall if this instruction is not finished.
 	/// 
 	/// This function writes to global state (LO0/HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First multiplicand
 	/// @param b Second multiplicand
-	FORCEINLINE void fma0_i32(int32_t a, int32_t b)
+	FORCEINLINE void fma0_i32(lohi_state_t* state, int32_t a, int32_t b)
 	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
 		asm volatile(
-			"madd %[A],%[B]"
-			: 
-			: [A] "%r" (a), [B] "r" (b)
+			"madd	%[A],%[B]"
+			:
+			: [A] "%r" (a),
+			  [B] "r" (b)
+			: "lo", "hi"
 		);
+#else
+		int64_t tmplo = 0;
+		int64_t tmphi = 0;
+
+		asm(
+			"mflo	%[TmpLo]\n\t"
+			"mfhi	%[TmpHi]\n\t"
+			"mtlo	%[StateLo]\n\t"
+			"mthi	%[StateHi]\n\t"
+			"madd	%[A],%[B]\n\t"
+			"mflo	%[StateLo]\n\t"
+			"mfhi	%[StateHi]\n\t"
+			"mtlo	%[TmpLo]\n\t"
+			"mthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [StateLo] "+r" (state->lo[0]),
+			  [StateHi] "+r" (state->hi[0])
+			: [A] "%r" (a),
+			  [B] "r" (b)
+		);
+#endif
 	}
 
 	/// @brief MADD : Multiply-ADD word
@@ -1339,20 +2180,17 @@ extern "C" {
 	/// 'fma0_i32' for details.
 	/// 
 	/// This function writes to global state (LO0/HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First multiplicand
 	/// @param b Second multiplicand
 	/// @return Struct containing bot the low and high 32 bits of the accumulator after the
 	/// fused-multiply-add operation.
-	FORCEINLINE mul_i32_result_t fma0_i32_finish(int32_t a, int32_t b)
+	FORCEINLINE mul_i32_result_t fma0_i32_finish(lohi_state_t* state, int32_t a, int32_t b)
 	{
-		mul_i32_result_t result;
+		mul_i32_result_t result = { 0, 0 };
 
-		asm volatile(
-			"madd %[Lo],%[A],%[B]\n\t"
-			"mfhi %[Hi]"
-			: [Lo] "=r" (result.lo), [Hi] "=r" (result.hi)
-			: [A] "%r" (a), [B] "r" (b)
-		);
+		result.lo = fma0_i32_lo(state, a, b);
+		result.hi = load_hi0_32(state);
 
 		return result;
 	}
@@ -1368,20 +2206,51 @@ extern "C" {
 	/// the return value will cause a stall if this instruction is not finished.
 	/// 
 	/// This function writes to global state (LO0/HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First multiplicand
 	/// @param b Second multiplicand
 	/// @return Low 32 bits (LO0) of the accumulator after the fused-multiply-add operation
-	FORCEINLINE uint32_t fma0_u32_lo(uint32_t a, uint32_t b)
+	FORCEINLINE uint32_t fma0_u32_lo(lohi_state_t* state, uint32_t a, uint32_t b)
 	{
-		uint32_t lo;
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+		int32_t lo = 0;
 
 		asm volatile(
-			"maddu %[Lo],%[A],%[B]"
+			"maddu	%[Lo],%[A],%[B]"
 			: [Lo] "=r" (lo)
-			: [A] "%r" (a), [B] "r" (b)
-			);
+			: [A] "%r" (a),
+			  [B] "r" (b)
+			: "lo", "hi"
+		);
 
 		return lo;
+#else
+		int32_t lo = 0;
+		int64_t tmplo = 0;
+		int64_t tmphi = 0;
+
+		asm(
+			"mflo	%[TmpLo]\n\t"
+			"mfhi	%[TmpHi]\n\t"
+			"mtlo	%[StateLo]\n\t"
+			"mthi	%[StateHi]\n\t"
+			"maddu	%[Lo],%[A],%[B]\n\t"
+			"mflo	%[StateLo]\n\t"
+			"mfhi	%[StateHi]\n\t"
+			"mtlo	%[TmpLo]\n\t"
+			"mthi	%[TmpHi]"
+			: [Lo] "=r" (lo),
+			  [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [StateLo] "+r" (state->lo[0]),
+			  [StateHi] "+r" (state->hi[0])
+			: [A] "%r" (a),
+			  [B] "r" (b)
+		);
+
+		return lo;
+#endif
 	}
 
 	/// @brief MADDU : Multiply-ADD Unsigned word
@@ -1395,15 +2264,43 @@ extern "C" {
 	/// will cause a stall if this instruction is not finished.
 	/// 
 	/// This function writes to global state (LO0/HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First multiplicand
 	/// @param b Second multiplicand
-	FORCEINLINE void fma0_u32(uint32_t a, uint32_t b)
+	FORCEINLINE void fma0_u32(lohi_state_t* state, uint32_t a, uint32_t b)
 	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
 		asm volatile(
-			"maddu %[A],%[B]"
+			"maddu	%[A],%[B]"
 			:
-			: [A] "%r" (a), [B] "r" (b)
+			: [A] "%r" (a),
+			  [B] "r" (b)
+			: "lo", "hi"
 		);
+#else
+		int64_t tmplo = 0;
+		int64_t tmphi = 0;
+
+		asm(
+			"mflo	%[TmpLo]\n\t"
+			"mfhi	%[TmpHi]\n\t"
+			"mtlo	%[StateLo]\n\t"
+			"mthi	%[StateHi]\n\t"
+			"maddu	%[A],%[B]\n\t"
+			"mflo	%[StateLo]\n\t"
+			"mfhi	%[StateHi]\n\t"
+			"mtlo	%[TmpLo]\n\t"
+			"mthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [StateLo] "+r" (state->lo[0]),
+			  [StateHi] "+r" (state->hi[0])
+			: [A] "%r" (a),
+			  [B] "r" (b)
+		);
+#endif
 	}
 
 	/// @brief MADDU : Multiply-ADD Unsigned word
@@ -1417,20 +2314,17 @@ extern "C" {
 	/// 'fma0_u32' for details.
 	/// 
 	/// This function writes to global state (LO0/HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First multiplicand
 	/// @param b Second multiplicand
 	/// @return Struct containing bot the low and high 32 bits of the accumulator after the
 	/// fused-multiply-add operation.
-	FORCEINLINE mul_u32_result_t fma0_u32_finish(uint32_t a, uint32_t b)
+	FORCEINLINE mul_u32_result_t fma0_u32_finish(lohi_state_t* state, uint32_t a, uint32_t b)
 	{
-		mul_u32_result_t result;
+		mul_u32_result_t result = { 0, 0 };
 
-		asm volatile(
-			"maddu %[Lo],%[A],%[B]\n\t"
-			"mfhi %[Hi]"
-			: [Lo] "=r" (result.lo), [Hi] "=r" (result.hi)
-			: [A] "%r" (a), [B] "r" (b)
-		);
+		result.lo = fma0_u32_lo(state, a, b);
+		result.hi = load_hi0_32(state);
 
 		return result;
 	}
@@ -1446,20 +2340,51 @@ extern "C" {
 	/// the return value will cause a stall if this instruction is not finished.
 	/// 
 	/// This function writes to global state (LO1/HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First multiplicand
 	/// @param b Second multiplicand
 	/// @return Low 32 bits (LO1) of the accumulator after the fused-multiply-add operation
-	FORCEINLINE int32_t fma1_i32_lo(int32_t a, int32_t b)
+	FORCEINLINE int32_t fma1_i32_lo(lohi_state_t* state, int32_t a, int32_t b)
 	{
-		int32_t lo;
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+		int32_t lo = 0;
 
 		asm volatile(
-			"madd1 %[Lo],%[A],%[B]"
+			"madd1	%[Lo],%[A],%[B]"
 			: [Lo] "=r" (lo)
-			: [A] "%r" (a), [B] "r" (b)
+			: [A] "%r" (a),
+			  [B] "r" (b)
+			: "lo", "hi"
 		);
 
 		return lo;
+#else
+		int32_t lo = 0;
+		int64_t tmplo = 0;
+		int64_t tmphi = 0;
+
+		asm(
+			"mflo1	%[TmpLo]\n\t"
+			"mfhi1	%[TmpHi]\n\t"
+			"mtlo1	%[StateLo]\n\t"
+			"mthi1	%[StateHi]\n\t"
+			"madd1	%[Lo],%[A],%[B]\n\t"
+			"mflo1	%[StateLo]\n\t"
+			"mfhi1	%[StateHi]\n\t"
+			"mtlo1	%[TmpLo]\n\t"
+			"mthi1	%[TmpHi]"
+			: [Lo] "=r" (lo),
+			  [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [StateLo] "+r" (state->lo[1]),
+			  [StateHi] "+r" (state->hi[1])
+			: [A] "%r" (a),
+			  [B] "r" (b)
+		);
+
+		return lo;
+#endif
 	}
 
 	/// @brief MADD1 : Multiply-ADD word pipeline 1
@@ -1473,15 +2398,43 @@ extern "C" {
 	/// will cause a stall if this instruction is not finished.
 	/// 
 	/// This function writes to global state (LO1/HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First multiplicand
 	/// @param b Second multiplicand
-	FORCEINLINE void fma1_i32(int32_t a, int32_t b)
+	FORCEINLINE void fma1_i32(lohi_state_t* state, int32_t a, int32_t b)
 	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
 		asm volatile(
-			"madd1 %[A],%[B]"
+			"madd1	%[A],%[B]"
 			:
-			: [A] "%r" (a), [B] "r" (b)
+			: [A] "%r" (a),
+			  [B] "r" (b)
+			: "lo", "hi"
 		);
+#else
+		int64_t tmplo = 0;
+		int64_t tmphi = 0;
+
+		asm(
+			"mflo1	%[TmpLo]\n\t"
+			"mfhi1	%[TmpHi]\n\t"
+			"mtlo1	%[StateLo]\n\t"
+			"mthi1	%[StateHi]\n\t"
+			"madd1	%[A],%[B]\n\t"
+			"mflo1	%[StateLo]\n\t"
+			"mfhi1	%[StateHi]\n\t"
+			"mtlo1	%[TmpLo]\n\t"
+			"mthi1	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [StateLo] "+r" (state->lo[1]),
+			  [StateHi] "+r" (state->hi[1])
+			: [A] "%r" (a),
+			  [B] "r" (b)
+		);
+#endif
 	}
 
 	/// @brief MADD1 : Multiply-ADD word pipeline 1
@@ -1495,20 +2448,17 @@ extern "C" {
 	/// 'fma1_i32' for details.
 	/// 
 	/// This function writes to global state (LO1/HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First multiplicand
 	/// @param b Second multiplicand
 	/// @return Struct containing bot the low and high 32 bits of the accumulator after the
 	/// fused-multiply-add operation.
-	FORCEINLINE mul_i32_result_t fma1_i32_finish(int32_t a, int32_t b)
+	FORCEINLINE mul_i32_result_t fma1_i32_finish(lohi_state_t* state, int32_t a, int32_t b)
 	{
-		mul_i32_result_t result;
+		mul_i32_result_t result = { 0, 0 };
 
-		asm volatile(
-			"madd1 %[Lo],%[A],%[B]\n\t"
-			"mfhi1 %[Hi]"
-			: [Lo] "=r" (result.lo), [Hi] "=r" (result.hi)
-			: [A] "%r" (a), [B] "r" (b)
-			);
+		result.lo = fma1_i32_lo(state, a, b);
+		result.hi = load_hi1_32(state);
 
 		return result;
 	}
@@ -1524,20 +2474,51 @@ extern "C" {
 	/// the return value will cause a stall if this instruction is not finished.
 	/// 
 	/// This function writes to global state (LO1/HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First multiplicand
 	/// @param b Second multiplicand
 	/// @return Low 32 bits (LO1) of the accumulator after the fused-multiply-add operation
-	FORCEINLINE uint32_t fma1_u32_lo(uint32_t a, uint32_t b)
+	FORCEINLINE uint32_t fma1_u32_lo(lohi_state_t* state, uint32_t a, uint32_t b)
 	{
-		uint32_t lo;
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+		int32_t lo = 0;
 
 		asm volatile(
-			"maddu1 %[Lo],%[A],%[B]"
+			"maddu1	%[Lo],%[A],%[B]"
 			: [Lo] "=r" (lo)
-			: [A] "%r" (a), [B] "r" (b)
+			: [A] "%r" (a),
+			  [B] "r" (b)
+			: "lo", "hi"
 		);
 
 		return lo;
+#else
+		int32_t lo = 0;
+		int64_t tmplo = 0;
+		int64_t tmphi = 0;
+
+		asm(
+			"mflo1	%[TmpLo]\n\t"
+			"mfhi1	%[TmpHi]\n\t"
+			"mtlo1	%[StateLo]\n\t"
+			"mthi1	%[StateHi]\n\t"
+			"maddu1	%[Lo],%[A],%[B]\n\t"
+			"mflo1	%[StateLo]\n\t"
+			"mfhi1	%[StateHi]\n\t"
+			"mtlo1	%[TmpLo]\n\t"
+			"mthi1	%[TmpHi]"
+			: [Lo] "=r" (lo),
+			  [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [StateLo] "+r" (state->lo[1]),
+			  [StateHi] "+r" (state->hi[1])
+			: [A] "%r" (a),
+			  [B] "r" (b)
+		);
+
+		return lo;
+#endif
 	}
 
 	/// @brief MADDU1 : Multiply-ADD Unsigned word pipeline 1
@@ -1551,15 +2532,43 @@ extern "C" {
 	/// will cause a stall if this instruction is not finished.
 	/// 
 	/// This function writes to global state (LO1/HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First multiplicand
 	/// @param b Second multiplicand
-	FORCEINLINE void fma1_u32(uint32_t a, uint32_t b)
+	FORCEINLINE void fma1_u32(lohi_state_t* state, uint32_t a, uint32_t b)
 	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
 		asm volatile(
-			"maddu1 %[A],%[B]"
+			"maddu1	%[A],%[B]"
 			:
-			: [A] "%r" (a), [B] "r" (b)
+			: [A] "%r" (a),
+			  [B] "r" (b)
+			: "lo", "hi"
 		);
+#else
+		int64_t tmplo = 0;
+		int64_t tmphi = 0;
+
+		asm(
+			"mflo1	%[TmpLo]\n\t"
+			"mfhi1	%[TmpHi]\n\t"
+			"mtlo1	%[StateLo]\n\t"
+			"mthi1	%[StateHi]\n\t"
+			"maddu1	%[A],%[B]\n\t"
+			"mflo1	%[StateLo]\n\t"
+			"mfhi1	%[StateHi]\n\t"
+			"mtlo1	%[TmpLo]\n\t"
+			"mthi1	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [StateLo] "+r" (state->lo[1]),
+			  [StateHi] "+r" (state->hi[1])
+			: [A] "%r" (a),
+			  [B] "r" (b)
+		);
+#endif
 	}
 
 	/// @brief MADDU1 : Multiply-ADD Unsigned word pipeline 1
@@ -1573,20 +2582,17 @@ extern "C" {
 	/// 'fma1_u32' for details.
 	/// 
 	/// This function writes to global state (LO1/HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param a First multiplicand
 	/// @param b Second multiplicand
 	/// @return Struct containing bot the low and high 32 bits of the accumulator after the
 	/// fused-multiply-add operation.
-	FORCEINLINE mul_u32_result_t fma1_u32_finish(uint32_t a, uint32_t b)
+	FORCEINLINE mul_u32_result_t fma1_u32_finish(lohi_state_t* state, uint32_t a, uint32_t b)
 	{
-		mul_u32_result_t result;
+		mul_u32_result_t result = { 0, 0 };
 
-		asm volatile(
-			"maddu1 %[Lo],%[A],%[B]\n\t"
-			"mfhi1 %[Hi]"
-			: [Lo] "=r" (result.lo), [Hi] "=r" (result.hi)
-			: [A] "%r" (a), [B] "r" (b)
-		);
+		result.lo = fma1_u32_lo(state, a, b);
+		result.hi = load_hi1_32(state);
 
 		return result;
 	}
@@ -1631,16 +2637,41 @@ extern "C" {
 	/// 'divrem0_i32_finish'.
 	/// 
 	/// This function writes to global state (LO0/HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param dividend Number to divide
 	/// @param divisor Number to divide by
-	FORCEINLINE void divrem0_i32_start(int32_t dividend, int32_t divisor)
+	FORCEINLINE void divrem0_i32_start(lohi_state_t* state, int32_t dividend, int32_t divisor)
 	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
 		// this needs an extra destination $0 register due to a quirk in the compiler
 		asm volatile(
-			"div $0,%[Dividend],%[Divisor]"							// 
-			:														// output operands
-			: [Dividend] "r" (dividend), [Divisor] "r" (divisor)	// input operands
+			"div	$0,%[Dividend],%[Divisor]"
+			:																/* output operands	*/
+			: [Dividend] "r" (dividend),									/* input operands	*/
+			  [Divisor] "r" (divisor)
+			: "lo", "hi"
 		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
+
+		asm(
+			"mflo	%[TmpLo]\n\t"
+			"mfhi	%[TmpHi]\n\t"
+			"div	$0,%[Dividend],%[Divisor]\n\t"
+			"mflo	%[ResLo]\n\t"
+			"mfhi	%[ResHi]\n\t"
+			"mtlo	%[TmpLo]\n\t"
+			"mthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [ResLo] "=r" (state->lo[0]),
+			  [ResHi] "=r" (state->hi[0])
+			: [Dividend] "r" (dividend),
+			  [Divisor] "r" (divisor)
+		);
+#endif
 	}
 
 	/// @brief DIV : DIVide word
@@ -1650,13 +2681,14 @@ extern "C" {
 	/// See decumentation of 'divrem0_i32_start'.
 	/// 
 	/// This function reads global state (LO0/HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return struct containing quotient and remainder of preceding division.
-	FORCEINLINE PURE divrem_i32_result_t divrem0_i32_finish()
+	FORCEINLINE PURE divrem_i32_result_t divrem0_i32_finish(lohi_state_t* state)
 	{
-		divrem_i32_result_t result;
+		divrem_i32_result_t result = { 0, 0 };
 
-		result.quotient = load_lo0_32();
-		result.remainder = load_hi0_32();
+		result.quotient = load_lo0_32(state);
+		result.remainder = load_hi0_32(state);
 
 		return result;
 	}
@@ -1682,13 +2714,14 @@ extern "C" {
 	/// 'divrem0_i32_start'.
 	/// 
 	/// This function writes to global state (LO0/HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param dividend Number to divide
 	/// @param divisor Number to divide by
 	/// @return struct containing quotient and remainder of division.
-	FORCEINLINE divrem_i32_result_t divrem0_i32(int32_t dividend, int32_t divisor)
+	FORCEINLINE divrem_i32_result_t divrem0_i32(lohi_state_t* state, int32_t dividend, int32_t divisor)
 	{
-		divrem0_i32_start(dividend, divisor);
-		return divrem0_i32_finish();
+		divrem0_i32_start(state, dividend, divisor);
+		return divrem0_i32_finish(state);
 	}
 
 	/// @brief DIVU : DIVide Unsigned word
@@ -1720,16 +2753,41 @@ extern "C" {
 	/// 'divrem0_u32_finish'.
 	/// 
 	/// This function writes to global state (LO0/HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param dividend Number to divide
 	/// @param divisor Number to divide by
-	FORCEINLINE void divrem0_u32_start(uint32_t dividend, uint32_t divisor)
+	FORCEINLINE void divrem0_u32_start(lohi_state_t* state, uint32_t dividend, uint32_t divisor)
 	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
 		// this needs an extra destination $0 register due to a quirk in the compiler
 		asm volatile(
-			"divu $0,%[Dividend],%[Divisor]"						// 
-			:														// output operands
-			: [Dividend] "r" (dividend), [Divisor] "r" (divisor)	// input operands
+			"divu	$0,%[Dividend],%[Divisor]"
+			:																/* output operands	*/
+			: [Dividend] "r" (dividend),									/* input operands	*/
+			  [Divisor] "r" (divisor)
+			: "lo", "hi"
 		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
+
+		asm(
+			"mflo	%[TmpLo]\n\t"
+			"mfhi	%[TmpHi]\n\t"
+			"divu	$0,%[Dividend],%[Divisor]\n\t"
+			"mflo	%[ResLo]\n\t"
+			"mfhi	%[ResHi]\n\t"
+			"mtlo	%[TmpLo]\n\t"
+			"mthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [ResLo] "=r" (state->lo[0]),
+			  [ResHi] "=r" (state->hi[0])
+			: [Dividend] "r" (dividend),
+			  [Divisor] "r" (divisor)
+		);
+#endif
 	}
 
 	/// @brief DIVU : DIVide Unsigned word
@@ -1739,13 +2797,14 @@ extern "C" {
 	/// See decumentation of 'divrem0_u32_start'.
 	/// 
 	/// This function reads global state (LO0/HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return struct containing quotient and remainder of preceding division.
-	FORCEINLINE PURE divrem_u32_result_t divrem0_u32_finish()
+	FORCEINLINE PURE divrem_u32_result_t divrem0_u32_finish(lohi_state_t* state)
 	{
-		divrem_u32_result_t result;
+		divrem_u32_result_t result = { 0, 0 };
 
-		result.quotient = load_lo0_32();
-		result.remainder = load_hi0_32();
+		result.quotient = load_lo0_32(state);
+		result.remainder = load_hi0_32(state);
 
 		return result;
 	}
@@ -1761,13 +2820,14 @@ extern "C" {
 	/// 'divrem0_u32_start'.
 	/// 
 	/// This function writes to global state (LO0/HI0).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param dividend Number to divide
 	/// @param divisor Number to divide by
 	/// @return struct containing quotient and remainder of division.
-	FORCEINLINE divrem_u32_result_t divrem0_u32(uint32_t dividend, uint32_t divisor)
+	FORCEINLINE divrem_u32_result_t divrem0_u32(lohi_state_t* state, uint32_t dividend, uint32_t divisor)
 	{
-		divrem0_u32_start(dividend, divisor);
-		return divrem0_u32_finish();
+		divrem0_u32_start(state, dividend, divisor);
+		return divrem0_u32_finish(state);
 	}
 
 	/// @brief DIV1 : Divide Word Pipeline 1
@@ -1809,16 +2869,41 @@ extern "C" {
 	/// 'divrem1_i32_finish'.
 	/// 
 	/// This function writes to global state (LO1/HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param dividend Number to divide
 	/// @param divisor Number to divide by
-	FORCEINLINE void divrem1_i32_start(int32_t dividend, int32_t divisor)
+	FORCEINLINE void divrem1_i32_start(lohi_state_t* state, int32_t dividend, int32_t divisor)
 	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
 		// this needs an extra destination $0 register due to a quirk in the compiler
 		asm volatile(
-			"div1 $0,%[Dividend],%[Divisor]"						// 
-			:														// output operands
-			: [Dividend] "r" (dividend), [Divisor] "r" (divisor)	// input operands
+			"div1	$0,%[Dividend],%[Divisor]"
+			:																/* output operands	*/
+			: [Dividend] "r" (dividend),									/* input operands	*/
+			  [Divisor] "r" (divisor)
+			: "lo", "hi"
 		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
+
+		asm(
+			"mflo1	%[TmpLo]\n\t"
+			"mfhi1	%[TmpHi]\n\t"
+			"div1	$0,%[Dividend],%[Divisor]\n\t"
+			"mflo1	%[ResLo]\n\t"
+			"mfhi1	%[ResHi]\n\t"
+			"mtlo1	%[TmpLo]\n\t"
+			"mthi1	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			[TmpHi] "=&r" (tmphi),
+			[ResLo] "=r" (state->lo[1]),
+			[ResHi] "=r" (state->hi[1])
+			: [Dividend] "r" (dividend),
+			[Divisor] "r" (divisor)
+		);
+#endif
 	}
 
 	/// @brief DIV1 : Divide Word Pipeline 1
@@ -1828,13 +2913,14 @@ extern "C" {
 	/// See decumentation of 'divrem1_i32_start'.
 	/// 
 	/// This function reads global state (LO1/HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return struct containing quotient and remainder of preceding division.
-	FORCEINLINE PURE divrem_i32_result_t divrem1_i32_finish()
+	FORCEINLINE PURE divrem_i32_result_t divrem1_i32_finish(lohi_state_t* state)
 	{
-		divrem_i32_result_t result;
+		divrem_i32_result_t result = { 0, 0 };
 
-		result.quotient = load_lo1_32();
-		result.remainder = load_hi1_32();
+		result.quotient = load_lo1_32(state);
+		result.remainder = load_hi1_32(state);
 
 		return result;
 	}
@@ -1860,13 +2946,14 @@ extern "C" {
 	/// 'divrem1_i32_start'.
 	/// 
 	/// This function writes to global state (LO1/HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param dividend Number to divide
 	/// @param divisor Number to divide by
 	/// @return struct containing quotient and remainder of division.
-	FORCEINLINE divrem_i32_result_t divrem1_i32(int32_t dividend, int32_t divisor)
+	FORCEINLINE divrem_i32_result_t divrem1_i32(lohi_state_t* state, int32_t dividend, int32_t divisor)
 	{
-		divrem1_i32_start(dividend, divisor);
-		return divrem1_i32_finish();
+		divrem1_i32_start(state, dividend, divisor);
+		return divrem1_i32_finish(state);
 	}
 
 	/// @brief DIVU1 : DIVide Unsigned word pipeline 1
@@ -1898,16 +2985,41 @@ extern "C" {
 	/// 'divrem1_i32_finish'.
 	/// 
 	/// This function writes to global state (LO1/HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param dividend Number to divide
 	/// @param divisor Number to divide by
-	FORCEINLINE void divrem1_u32_start(uint32_t dividend, uint32_t divisor)
+	FORCEINLINE void divrem1_u32_start(lohi_state_t* state, uint32_t dividend, uint32_t divisor)
 	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
 		// this needs an extra destination $0 register due to a quirk in the compiler
 		asm volatile(
-			"divu1 $0,%[Dividend],%[Divisor]"						// 
-			:														// output operands
-			: [Dividend] "r" (dividend), [Divisor] "r" (divisor)	// input operands
+			"divu1	$0,%[Dividend],%[Divisor]"
+			:																/* output operands	*/
+			: [Dividend] "r" (dividend),									/* input operands	*/
+			  [Divisor] "r" (divisor)
+			: "lo", "hi"
 		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
+
+		asm(
+			"mflo1	%[TmpLo]\n\t"
+			"mfhi1	%[TmpHi]\n\t"
+			"divu1	$0,%[Dividend],%[Divisor]\n\t"
+			"mflo1	%[ResLo]\n\t"
+			"mfhi1	%[ResHi]\n\t"
+			"mtlo1	%[TmpLo]\n\t"
+			"mthi1	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [ResLo] "=r" (state->lo[1]),
+			  [ResHi] "=r" (state->hi[1])
+			: [Dividend] "r" (dividend),
+			  [Divisor] "r" (divisor)
+		);
+#endif
 	}
 
 	/// @brief DIVU1 : DIVide Unsigned word pipeline 1
@@ -1917,13 +3029,14 @@ extern "C" {
 	/// See decumentation of 'divrem1_i32_start'.
 	/// 
 	/// This function reads global state (LO1/HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return struct containing quotient and remainder of preceding division.
-	FORCEINLINE PURE divrem_u32_result_t divrem1_u32_finish()
+	FORCEINLINE PURE divrem_u32_result_t divrem1_u32_finish(lohi_state_t* state)
 	{
-		divrem_u32_result_t result;
+		divrem_u32_result_t result = { 0, 0 };
 
-		result.quotient = load_lo1_32();
-		result.remainder = load_hi1_32();
+		result.quotient = load_lo1_32(state);
+		result.remainder = load_hi1_32(state);
 
 		return result;
 	}
@@ -1939,13 +3052,14 @@ extern "C" {
 	/// 'divrem1_u32_start'.
 	/// 
 	/// This function writes to global state (LO1/HI1).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param dividend Number to divide
 	/// @param divisor Number to divide by
 	/// @return struct containing quotient and remainder of division.
-	FORCEINLINE divrem_u32_result_t divrem1_u32(uint32_t dividend, uint32_t divisor)
+	FORCEINLINE divrem_u32_result_t divrem1_u32(lohi_state_t* state, uint32_t dividend, uint32_t divisor)
 	{
-		divrem1_u32_start(dividend, divisor);
-		return divrem1_u32_finish();
+		divrem1_u32_start(state, dividend, divisor);
+		return divrem1_u32_finish(state);
 	}
 
 
@@ -1955,162 +3069,212 @@ extern "C" {
 	/// @return 128-bit packed integer containing 16 8-bit signed integers
 	FORCEINLINE CONST m128i8 mm_setzero_epi8()
 	{
-		m128i8 result;
+#ifdef PS2INTRIN_UNSAFE
+		m128i8 result = { 0 };
 
 		asm(
-			"por %[Result],$0,$0"		// just using 'move' makes assembler think we only mean lower 64 bits
-			: [Result] "=r" (result)
+			"por	%[Result],$0,$0"
+			: [Result] "=r" (result.v)
 		);
 
 		return result;
+#else
+		m128i8 result = { 0, 0 };
+		return result;
+#endif
 	}
 
 	/// @brief Create a 128-bit packed integer of all 0.
 	/// @return 128-bit packed integer containing 16 8-bit unsigned integers
 	FORCEINLINE CONST m128u8 mm_setzero_epu8()
 	{
-		m128u8 result;
+#ifdef PS2INTRIN_UNSAFE
+		m128u8 result = { 0 };
 
 		asm(
-			"por %[Result],$0,$0"		// just using 'move' makes assembler think we only mean lower 64 bits
-			: [Result] "=r" (result)
+			"por	%[Result],$0,$0"
+			: [Result] "=r" (result.v)
 		);
 
 		return result;
+#else
+		m128u8 result = { 0, 0 };
+		return result;
+#endif
 	}
 
 	/// @brief Create a 128-bit packed integer of all 0.
 	/// @return 128-bit packed integer containing 8 16-bit signed integers
 	FORCEINLINE CONST m128i16 mm_setzero_epi16()
 	{
-		m128i16 result;
+#ifdef PS2INTRIN_UNSAFE
+		m128i16 result = { 0 };
 
 		asm(
-			"por %[Result],$0,$0"		// just using 'move' makes assembler think we only mean lower 64 bits
-			: [Result] "=r" (result)
+			"por	%[Result],$0,$0"
+			: [Result] "=r" (result.v)
 		);
 
 		return result;
+#else
+		m128i16 result = { 0, 0 };
+		return result;
+#endif
 	}
 
 	/// @brief Create a 128-bit packed integer of all 0.
 	/// @return 128-bit packed integer containing 8 16-bit unsigned integers
 	FORCEINLINE CONST m128u16 mm_setzero_epu16()
 	{
-		m128u16 result;
+#ifdef PS2INTRIN_UNSAFE
+		m128u16 result = { 0 };
 
 		asm(
-			"por %[Result],$0,$0"		// just using 'move' makes assembler think we only mean lower 64 bits
-			: [Result] "=r" (result)
+			"por	%[Result],$0,$0"
+			: [Result] "=r" (result.v)
 		);
 
 		return result;
+#else
+		m128u16 result = { 0, 0 };
+		return result;
+#endif
 	}
 
 	/// @brief Create a 128-bit packed integer of all 0.
 	/// @return 128-bit packed integer containing 4 32-bit signed integers
 	FORCEINLINE CONST m128i32 mm_setzero_epi32()
 	{
-		m128i32 result;
+#ifdef PS2INTRIN_UNSAFE
+		m128i32 result = { 0 };
 
 		asm(
-			"por %[Result],$0,$0"		// just using 'move' makes assembler think we only mean lower 64 bits
-			: [Result] "=r" (result)
+			"por	%[Result],$0,$0"
+			: [Result] "=r" (result.v)
 		);
 
 		return result;
+#else
+		m128i32 result = { 0, 0 };
+		return result;
+#endif
 	}
 
 	/// @brief Create a 128-bit packed integer of all 0.
 	/// @return 128-bit packed integer containing 4 32-bit unsigned integers
 	FORCEINLINE CONST m128u32 mm_setzero_epu32()
 	{
-		m128u32 result;
+#ifdef PS2INTRIN_UNSAFE
+		m128u32 result = { 0 };
 
 		asm(
-			"por %[Result],$0,$0"		// just using 'move' makes assembler think we only mean lower 64 bits
-			: [Result] "=r" (result)
+			"por	%[Result],$0,$0"
+			: [Result] "=r" (result.v)
 		);
 
 		return result;
+#else
+		m128u32 result = { 0, 0 };
+		return result;
+#endif
 	}
 
 	/// @brief Create a 128-bit packed integer of all 0.
 	/// @return 128-bit packed integer containing 2 64-bit signed integers
 	FORCEINLINE CONST m128i64 mm_setzero_epi64()
 	{
-		m128i64 result;
+#ifdef PS2INTRIN_UNSAFE
+		m128i64 result = { 0 };
 
 		asm(
-			"por %[Result],$0,$0"		// just using 'move' makes assembler think we only mean lower 64 bits
-			: [Result] "=r" (result)
+			"por	%[Result],$0,$0"
+			: [Result] "=r" (result.v)
 		);
 
 		return result;
+#else
+		m128i64 result = { 0, 0 };
+		return result;
+#endif
 	}
 
 	/// @brief Create a 128-bit packed integer of all 0.
 	/// @return 128-bit packed integer containing 2 64-bit unsigned integers
 	FORCEINLINE CONST m128u64 mm_setzero_epu64()
 	{
-		m128u64 result;
+#ifdef PS2INTRIN_UNSAFE
+		m128u64 result = { 0 };
 
 		asm(
-			"por %[Result],$0,$0"		// just using 'move' makes assembler think we only mean lower 64 bits
-			: [Result] "=r" (result)
+			"por	%[Result],$0,$0"
+			: [Result] "=r" (result.v)
 		);
 
 		return result;
+#else
+		m128u64 result = { 0, 0 };
+		return result;
+#endif
 	}
 
 	/// @brief Create a 128-bit packed integer of all 0.
 	/// @return 128-bit packed integer containing 1 128-bit signed integers
 	FORCEINLINE CONST m128i128 mm_setzero_epi128()
 	{
-		m128i128 result;
+#ifdef PS2INTRIN_UNSAFE
+		m128i128 result = { 0 };
 
 		asm(
-			"por %[Result],$0,$0"		// just using 'move' makes assembler think we only mean lower 64 bits
-			: [Result] "=r" (result)
+			"por	%[Result],$0,$0"
+			: [Result] "=r" (result.v)
 		);
 
 		return result;
+#else
+		m128i128 result = { 0, 0 };
+		return result;
+#endif
 	}
 
 	/// @brief Create a 128-bit packed integer of all 0.
 	/// @return 128-bit packed integer containing 1 128-bit unsigned integers
 	FORCEINLINE CONST m128u128 mm_setzero_epu128()
 	{
-		m128u128 result;
+#ifdef PS2INTRIN_UNSAFE
+		m128u128 result = { 0 };
 
 		asm(
-			"por %[Result],$0,$0"		// just using 'move' makes assembler think we only mean lower 64 bits
-			: [Result] "=r" (result)
+			"por	%[Result],$0,$0"
+			: [Result] "=r" (result.v)
 		);
 
 		return result;
+#else
+		m128u128 result = { 0, 0 };
+		return result;
+#endif
 	}
 
-
-	/// @brief LQ : Load Quadword
-	/// 
-	/// Load a 128-bit value from memory.
-	/// 
-	/// This is a helper macro. Prefer using the specific functions instead.
-	/// 
-	/// The memory location must aligned on a 16-byte boundary. Otherwise the next 16-byte boundary
-	/// below the given memory location is used instead, loading unintended values.
-	/// 
-	/// This macro reads global state (*'address')
-	/// @param result Variable to store result to. Should be the name of a 128-bit variable.
-	/// @param address Address to load from. Must be a variable convertible to 'const void*'.
-#define LQ(result, address)																			\
+	// LQ
+#ifdef PS2INTRIN_UNSAFE
+	#define LQ(result, address)																		\
 	asm(																							\
-		"lq %[Result],%[Address]"																	\
-		: [Result] "=r" (result)						/*	output operands	*/						\
+		"lq	%[Result],%[Address]"																	\
+		: [Result] "=r" ((result).v)					/*	output operands	*/						\
 		: [Address] "o" (*(const char (*)[16]) address)	/*	input operands	Tell GCC that this is	\
 																reading 16 bytes from *address	*/	\
 	)
+#else
+	#define LQ(result, address)																		\
+	asm(																							\
+		"lq	%[ResultLo],%[Address]\n\t"																\
+		"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"												\
+		: [ResultLo] "=r" ((result).lo),				/*	output operands	*/						\
+		  [ResultHi] "=r" ((result).hi)																\
+		: [Address] "o" (*(const char (*)[16]) address)	/*	input operands	Tell GCC that this is	\
+																reading 16 bytes from *address	*/	\
+	)
+#endif
 
 	/// @brief LQ : Load Quadword
 	/// 
@@ -2124,7 +3288,7 @@ extern "C" {
 	/// @return Packed integer data loaded from given memory location.
 	FORCEINLINE UNSEQUENCED m128i8 mm_load_epi8(const m128i8* p)
 	{
-		m128i8 result;
+		m128i8 result = {};
 
 		LQ(result, p);
 
@@ -2143,7 +3307,7 @@ extern "C" {
 	/// @return Packed integer data loaded from given memory location.
 	FORCEINLINE UNSEQUENCED m128u8 mm_load_epu8(const m128u8* p)
 	{
-		m128u8 result;
+		m128u8 result = {};
 
 		LQ(result, p);
 
@@ -2162,7 +3326,7 @@ extern "C" {
 	/// @return Packed integer data loaded from given memory location.
 	FORCEINLINE UNSEQUENCED m128i16 mm_load_epi16(const m128i16* p)
 	{
-		m128i16 result;
+		m128i16 result = {};
 
 		LQ(result, p);
 
@@ -2181,7 +3345,7 @@ extern "C" {
 	/// @return Packed integer data loaded from given memory location.
 	FORCEINLINE UNSEQUENCED m128u16 mm_load_epu16(const m128u16* p)
 	{
-		m128u16 result;
+		m128u16 result = {};
 
 		LQ(result, p);
 
@@ -2200,7 +3364,7 @@ extern "C" {
 	/// @return Packed integer data loaded from given memory location.
 	FORCEINLINE UNSEQUENCED m128i32 mm_load_epi32(const m128i32* p)
 	{
-		m128i32 result;
+		m128i32 result = {};
 
 		LQ(result, p);
 
@@ -2219,7 +3383,7 @@ extern "C" {
 	/// @return Packed integer data loaded from given memory location.
 	FORCEINLINE UNSEQUENCED m128u32 mm_load_epu32(const m128u32* p)
 	{
-		m128u32 result;
+		m128u32 result = {};
 
 		LQ(result, p);
 
@@ -2238,7 +3402,7 @@ extern "C" {
 	/// @return Packed integer data loaded from given memory location.
 	FORCEINLINE UNSEQUENCED m128i64 mm_load_epi64(const m128i64* p)
 	{
-		m128i64 result;
+		m128i64 result = {};
 
 		LQ(result, p);
 
@@ -2257,7 +3421,7 @@ extern "C" {
 	/// @return Packed integer data loaded from given memory location.
 	FORCEINLINE UNSEQUENCED m128u64 mm_load_epu64(const m128u64* p)
 	{
-		m128u64 result;
+		m128u64 result = {};
 
 		LQ(result, p);
 
@@ -2276,7 +3440,7 @@ extern "C" {
 	/// @return Packed integer data loaded from given memory location.
 	FORCEINLINE UNSEQUENCED m128i128 mm_load_epi128(const m128i128* p)
 	{
-		m128i128 result;
+		m128i128 result = {};
 
 		LQ(result, p);
 
@@ -2295,7 +3459,7 @@ extern "C" {
 	/// @return Packed integer data loaded from given memory location.
 	FORCEINLINE UNSEQUENCED m128u128 mm_load_epu128(const m128u128* p)
 	{
-		m128u128 result;
+		m128u128 result = {};
 
 		LQ(result, p);
 
@@ -2304,26 +3468,89 @@ extern "C" {
 
 #undef LQ
 
-
-	/// @brief SQ : Store Quadword
+	/// @brief LQ : Load Quadword
 	/// 
-	/// Store a 128-bit value to memory.
-	/// 
-	/// This is a helper macro. Prefer using the specific functions instead.
+	/// Load 1 int128_t from memory.
 	/// 
 	/// The memory location must aligned on a 16-byte boundary. Otherwise the next 16-byte boundary
-	/// below the given memory location is used instead, storing to an unintended address.
+	/// below the given memory location is used instead, loading unintended values.
 	/// 
-	/// This macro writes to global state (*'address')
-	/// @param address Address to store to. Must be a variable convertible to 'void*'.
-	/// @param value Variable to write. Should be the name of a 128-bit variable.
-#define SQ(address, value)																			\
+	/// This function reads global state (*'p')
+	/// @param p Memory location to load integer data from.
+	/// @return Packed integer data loaded from given memory location.
+	FORCEINLINE UNSEQUENCED int128_t mm_load_i128(const int128_t* p)
+	{
+		uint64_t lo = 0;
+		uint64_t hi = 0;
+
+		asm(
+			"lq	%[ResultLo],%[Address]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (lo),							/*	output operands	*/
+			  [ResultHi] "=r" (hi)
+			: [Address] "o" (*(const char (*)[16]) p)		/*	input operands	Tell GCC that this is
+																	reading 16 bytes from *address	*/
+		);
+
+		uint128_t result = hi;
+		result <<= 64;
+		result |= lo;
+
+		return (int128_t)result;
+	}
+
+	/// @brief LQ : Load Quadword
+	/// 
+	/// Load 1 uint128_t from memory.
+	/// 
+	/// The memory location must aligned on a 16-byte boundary. Otherwise the next 16-byte boundary
+	/// below the given memory location is used instead, loading unintended values.
+	/// 
+	/// This function reads global state (*'p')
+	/// @param p Memory location to load integer data from.
+	/// @return Packed integer data loaded from given memory location.
+	FORCEINLINE UNSEQUENCED uint128_t mm_load_u128(const uint128_t* p)
+	{
+		uint64_t lo = 0;
+		uint64_t hi = 0;
+
+		asm(
+			"lq	%[ResultLo],%[Address]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (lo),							/*	output operands	*/
+			  [ResultHi] "=r" (hi)
+			: [Address] "o" (*(const char (*)[16]) p)		/*	input operands	Tell GCC that this is
+																	reading 16 bytes from *address	*/
+		);
+
+		uint128_t result = hi;
+		result <<= 64;
+		result |= lo;
+
+		return result;
+	}
+
+
+// SQ
+#ifdef PS2INTRIN_UNSAFE
+	#define SQ(address, value)																		\
 	asm(																							\
-		"sq %[Value],%[Address]"																	\
+		"sq	%[Value],%[Address]"																	\
 		: [Address] "=o" (*(char (*)[16]) address)		/*	output operands	Tell GCC that this is	\
 															writing 16 bytes to *address	*/		\
-		: [Value] "r" (value)							/*	input operands	*/						\
+		: [Value] "r" ((value).v)						/*	input operands	*/						\
 	)
+#else
+	#define SQ(address, value)																		\
+	asm(																							\
+		"pcpyld	%[ValueLo],%[ValueHi],%[ValueLo]\n\t"												\
+		"sq	%[ValueLo],%[Address]"																	\
+		: [Address] "=o" (*(char (*)[16]) address)		/*	output operands	Tell GCC that this is	\
+															writing 16 bytes to *address	*/		\
+		: [ValueLo] "r" ((value).lo),					/*	input operands	*/						\
+		  [ValueHi] "r" ((value).hi)																\
+	)
+#endif
 
 	/// @brief SQ : Store Quadword
 	/// 
@@ -2477,6 +3704,50 @@ extern "C" {
 
 #undef SQ
 
+	/// @brief SQ : Store Quadword
+	/// 
+	/// Store 1 int128_t to memory.
+	/// 
+	/// The memory location must aligned on a 16-byte boundary. Otherwise the next 16-byte boundary
+	/// below the given memory location is used instead, storing to an unintended address.
+	/// 
+	/// This function writes to global state (*'address')
+	/// @param p Address to store to.
+	/// @return Packed integer data to store to the memory location.
+	FORCEINLINE UNSEQUENCED void mm_store_i128(int128_t* p, int128_t value)
+	{
+		asm(
+			"pcpyld	%[ValueLo],%[ValueHi],%[ValueLo]\n\t"
+			"sq	%[ValueLo],%[Address]"
+			: [Address] "=o" (*(char (*)[16]) p)			/*	output operands	Tell GCC that this is
+																writing 16 bytes to *address	*/
+			: [ValueLo] "r" ((uint64_t)value),					/*	input operands	*/
+			  [ValueHi] "r" ((uint64_t)(value >> 64))
+		);
+	}
+
+	/// @brief SQ : Store Quadword
+	/// 
+	/// Store 1 uint128_t to memory.
+	/// 
+	/// The memory location must aligned on a 16-byte boundary. Otherwise the next 16-byte boundary
+	/// below the given memory location is used instead, storing to an unintended address.
+	/// 
+	/// This function writes to global state (*'address')
+	/// @param p Address to store to.
+	/// @return Packed integer data to store to the memory location.
+	FORCEINLINE UNSEQUENCED void mm_store_u128(uint128_t* p, uint128_t value)
+	{
+		asm(
+			"pcpyld	%[ValueLo],%[ValueHi],%[ValueLo]\n\t"
+			"sq	%[ValueLo],%[Address]"
+			: [Address] "=o" (*(char (*)[16]) p)			/*	output operands	Tell GCC that this is
+																writing 16 bytes to *address	*/
+			: [ValueLo] "r" ((uint64_t)value),					/*	input operands	*/
+			  [ValueHi] "r" ((uint64_t)(value >> 64))
+		);
+	}
+
 
 	/// @brief Set a 128-bit packed integer type with given values.
 	/// 
@@ -2509,7 +3780,7 @@ extern "C" {
 	FORCEINLINE CONST m128i8 mm_set_epi8(int8_t r15, int8_t r14, int8_t r13, int8_t r12, int8_t r11, int8_t r10, int8_t r9, int8_t r8,
 										 int8_t r7, int8_t r6, int8_t r5, int8_t r4, int8_t r3, int8_t r2, int8_t r1, int8_t r0)
 	{
-		m128i8 result;
+		m128i8 result = {};
 
 		uint64_t lo = r7  & 0xFF;
 		uint64_t hi = r15 & 0xFF;
@@ -2542,11 +3813,16 @@ extern "C" {
 		hi <<= 8;
 		hi |= r8  & 0xFF;
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pcpyld %[Result],%[Upper],%[Lower]"
-			: [Result] "=r" (result)
+			"pcpyld	%[Result],%[Upper],%[Lower]"
+			: [Result] "=r" (result.v)
 			: [Upper] "r" (hi), [Lower] "r" (lo)
 		);
+#else
+		result.lo = lo;
+		result.hi = hi;
+#endif
 
 		return result;
 	}
@@ -2582,7 +3858,7 @@ extern "C" {
 	FORCEINLINE CONST m128u8 mm_set_epu8(uint8_t r15, uint8_t r14, uint8_t r13, uint8_t r12, uint8_t r11, uint8_t r10, uint8_t r9, uint8_t r8,
 										 uint8_t r7, uint8_t r6, uint8_t r5, uint8_t r4, uint8_t r3, uint8_t r2, uint8_t r1, uint8_t r0)
 	{
-		m128u8 result;
+		m128u8 result = {};
 
 		uint64_t lo = r7  & 0xFF;
 		uint64_t hi = r15 & 0xFF;
@@ -2615,11 +3891,16 @@ extern "C" {
 		hi <<= 8;
 		hi |= r8  & 0xFF;
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pcpyld %[Result],%[Upper],%[Lower]"
-			: [Result] "=r" (result)
+			"pcpyld	%[Result],%[Upper],%[Lower]"
+			: [Result] "=r" (result.v)
 			: [Upper] "r" (hi), [Lower] "r" (lo)
 		);
+#else
+		result.lo = lo;
+		result.hi = hi;
+#endif
 
 		return result;
 	}
@@ -2646,7 +3927,7 @@ extern "C" {
 	/// @return Packed integer type initialized to the given values
 	FORCEINLINE CONST m128i16 mm_set_epi16(int16_t r7, int16_t r6, int16_t r5, int16_t r4, int16_t r3, int16_t r2, int16_t r1, int16_t r0)
 	{
-		m128i16 result;
+		m128i16 result = {};
 
 		uint64_t lo = r3 & 0xFFFF;
 		uint64_t hi = r7 & 0xFFFF;
@@ -2663,11 +3944,16 @@ extern "C" {
 		hi <<= 16;
 		hi |= r4 & 0xFFFF;
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pcpyld %[Result],%[Upper],%[Lower]"
-			: [Result] "=r" (result)
+			"pcpyld	%[Result],%[Upper],%[Lower]"
+			: [Result] "=r" (result.v)
 			: [Upper] "r" (hi), [Lower] "r" (lo)
 		);
+#else
+		result.lo = lo;
+		result.hi = hi;
+#endif
 
 		return result;
 	}
@@ -2694,7 +3980,7 @@ extern "C" {
 	/// @return Packed integer type initialized to the given values
 	FORCEINLINE CONST m128u16 mm_set_epu16(uint16_t r7, uint16_t r6, uint16_t r5, uint16_t r4, uint16_t r3, uint16_t r2, uint16_t r1, uint16_t r0)
 	{
-		m128u16 result;
+		m128u16 result = {};
 
 		uint64_t lo = r3 & 0xFFFF;
 		uint64_t hi = r7 & 0xFFFF;
@@ -2711,11 +3997,16 @@ extern "C" {
 		hi <<= 16;
 		hi |= r4 & 0xFFFF;
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pcpyld %[Result],%[Upper],%[Lower]"
-			: [Result] "=r" (result)
+			"pcpyld	%[Result],%[Upper],%[Lower]"
+			: [Result] "=r" (result.v)
 			: [Upper] "r" (hi), [Lower] "r" (lo)
 		);
+#else
+		result.lo = lo;
+		result.hi = hi;
+#endif
 
 		return result;
 	}
@@ -2738,7 +4029,7 @@ extern "C" {
 	/// @return Packed integer type initialized to the given values
 	FORCEINLINE CONST m128i32 mm_set_epi32(int32_t r3, int32_t r2, int32_t r1, int32_t r0)
 	{
-		m128i32 result;
+		m128i32 result = {};
 
 		uint64_t lo = r1 & 0xFFFFFFFF;
 		uint64_t hi = r3 & 0xFFFFFFFF;
@@ -2747,11 +4038,16 @@ extern "C" {
 		hi <<= 32;
 		hi |= r2 & 0xFFFFFFFF;
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pcpyld %[Result],%[Upper],%[Lower]"
-			: [Result] "=r" (result)
+			"pcpyld	%[Result],%[Upper],%[Lower]"
+			: [Result] "=r" (result.v)
 			: [Upper] "r" (hi), [Lower] "r" (lo)
 		);
+#else
+		result.lo = lo;
+		result.hi = hi;
+#endif
 
 		return result;
 	}
@@ -2774,7 +4070,7 @@ extern "C" {
 	/// @return Packed integer type initialized to the given values
 	FORCEINLINE CONST m128u32 mm_set_epu32(uint32_t r3, uint32_t r2, uint32_t r1, uint32_t r0)
 	{
-		m128u32 result;
+		m128u32 result = {};
 
 		uint64_t lo = r1 & 0xFFFFFFFF;
 		uint64_t hi = r3 & 0xFFFFFFFF;
@@ -2783,11 +4079,16 @@ extern "C" {
 		hi <<= 32;
 		hi |= r2 & 0xFFFFFFFF;
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pcpyld %[Result],%[Upper],%[Lower]"
-			: [Result] "=r" (result)
+			"pcpyld	%[Result],%[Upper],%[Lower]"
+			: [Result] "=r" (result.v)
 			: [Upper] "r" (hi), [Lower] "r" (lo)
 		);
+#else
+		result.lo = lo;
+		result.hi = hi;
+#endif
 
 		return result;
 	}
@@ -2808,13 +4109,18 @@ extern "C" {
 	/// @return Packed integer type initialized to the given values
 	FORCEINLINE CONST m128i64 mm_set_epi64(int64_t r1, int64_t r0)
 	{
-		m128i64 result;
+		m128i64 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pcpyld %[Result],%[Upper],%[Lower]"
-			: [Result] "=r" (result)
+			"pcpyld	%[Result],%[Upper],%[Lower]"
+			: [Result] "=r" (result.v)
 			: [Upper] "r" (r1), [Lower] "r" (r0)
 		);
+#else
+		result.lo = r0;
+		result.hi = r1;
+#endif
 
 		return result;
 	}
@@ -2835,13 +4141,18 @@ extern "C" {
 	/// @return Packed integer type initialized to the given values
 	FORCEINLINE CONST m128u64 mm_set_epu64(uint64_t r1, uint64_t r0)
 	{
-		m128u64 result;
+		m128u64 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pcpyld %[Result],%[Upper],%[Lower]"
-			: [Result] "=r" (result)
+			"pcpyld	%[Result],%[Upper],%[Lower]"
+			: [Result] "=r" (result.v)
 			: [Upper] "r" (r1), [Lower] "r" (r0)
 		);
+#else
+		result.lo = r0;
+		result.hi = r1;
+#endif
 
 		return result;
 	}
@@ -2853,8 +4164,19 @@ extern "C" {
 	/// @return Packed integer type initialized to the given values
 	FORCEINLINE CONST m128i128 mm_set_epi128(int128_t r0)
 	{
-		m128i128 result;
-		memcpy(&result, &r0, sizeof(m128i128));
+		m128i128 result = {};
+
+#ifdef PS2INTRIN_UNSAFE
+		asm(
+			"pcpyld	%[Result],%[Upper],%[Lower]"
+			: [Result] "=r" (result.v)
+			: [Upper] "r" ((uint64_t)(r0 >> 64)), [Lower] "r" ((uint64_t)(r0))
+		);
+#else
+		result.lo = r0;
+		result.hi = r0 >> 64;
+#endif
+
 		return result;
 	}
 
@@ -2865,20 +4187,43 @@ extern "C" {
 	/// @return Packed integer type initialized to the given values
 	FORCEINLINE CONST m128u128 mm_set_epu128(uint128_t r0)
 	{
-		m128u128 result;
-		memcpy(&result, &r0, sizeof(m128i128));
+		m128u128 result = {};
+
+#ifdef PS2INTRIN_UNSAFE
+		asm(
+			"pcpyld	%[Result],%[Upper],%[Lower]"
+			: [Result] "=r" (result.v)
+			: [Upper] "r" ((uint64_t)(r0 >> 64)), [Lower] "r" ((uint64_t)(r0))
+		);
+#else
+		result.lo = r0;
+		result.hi = r0 >> 64;
+#endif
+
 		return result;
 	}
 	
 
+	// CAST
+#ifdef PS2INTRIN_UNSAFE
 	/// Conversion functions
 	///
 	/// All of these functions are no-ops and follow the naming convention 'mm_cast<To>_<From>'
-#define CAST(NameTo, NameFrom) FORCEINLINE CONST m128 ## NameTo mm_castep ## NameTo ## _ep ## NameFrom (m128 ## NameFrom v) { \
-		m128 ## NameTo result;	\
-		memcpy(&result, &v, sizeof(v));	\
-		return result;	\
+	#define CAST(NameTo, NameFrom)																	\
+	FORCEINLINE CONST m128 ## NameTo mm_castep ## NameTo ## _ep ## NameFrom (m128 ## NameFrom v) {	\
+		m128 ## NameTo result = { v.v };																\
+		return result;																				\
 	}
+#else
+	/// Conversion functions
+	///
+	/// All of these functions are no-ops and follow the naming convention 'mm_cast<To>_<From>'
+	#define CAST(NameTo, NameFrom)																	\
+	FORCEINLINE CONST m128 ## NameTo mm_castep ## NameTo ## _ep ## NameFrom (m128 ## NameFrom v) {	\
+		m128 ## NameTo result = { v.lo, v.hi };														\
+		return result;																				\
+	}
+#endif
 
 	CAST(u8, i8);
 	CAST(i16, i8);
@@ -2989,17 +4334,21 @@ extern "C" {
 	/// @return 128-value with broadcasted values
 	FORCEINLINE PURE m128i8 mm_broadcast_epi8(int8_t v)
 	{
-		m128i8 result;
+#ifdef PS2INTRIN_UNSAFE
+		m128i8 result = {};
 
 		asm(
-			"pextlb %[Result],%[Value],%[Value]\n\t"
-			"pcpyld %[Result],%[Result],%[Result]\n\t"
-			"pcpyh %[Result],%[Result]"
-			: [Result] "=r" (result)
+			"pextlb	%[Result],%[Value],%[Value]\n\t"	/* double byte to fill lower halfword		*/
+			"pcpyld	%[Result],%[Result],%[Result]\n\t"	/* put lower halfword in both doublewords	*/
+			"pcpyh	%[Result],%[Result]"				/* broadcast lower halfword in both			*/
+			: [Result] "=r" (result.v)
 			: [Value] "r" (v)
 		);
 
 		return result;
+#else
+		return mm_set_epi8(v, v, v, v, v, v, v, v, v, v, v, v, v, v, v, v);
+#endif
 	}
 
 	/// @brief Broadcast Byte
@@ -3019,16 +4368,20 @@ extern "C" {
 	/// @return 128-value with broadcasted values
 	FORCEINLINE PURE m128i16 mm_broadcast_epi16(int16_t v)
 	{
-		m128i16 result;
+#ifdef PS2INTRIN_UNSAFE
+		m128i16 result = {};
 
 		asm(
-			"pcpyld %[Result],%[Value],%[Value]\n\t"
-			"pcpyh %[Result],%[Result]"
-			: [Result] "=r" (result)
+			"pcpyld	%[Result],%[Value],%[Value]\n\t"	/* put lower halfword in both doublewords	*/
+			"pcpyh	%[Result],%[Result]"				/* broadcast lower halfword in both			*/
+			: [Result] "=r" (result.v)
 			: [Value] "r" (v)
 		);
 
 		return result;
+#else
+		return mm_set_epi16(v, v, v, v, v, v, v, v);
+#endif
 	}
 
 	/// @brief Broadcast Halfword
@@ -3048,16 +4401,20 @@ extern "C" {
 	/// @return 128-value with broadcasted values
 	FORCEINLINE PURE m128i32 mm_broadcast_epi32(int32_t v)
 	{
-		m128i32 result;
+#ifdef PS2INTRIN_UNSAFE
+		m128i32 result = {};
 
 		asm(
-			"pextlw %[Result],%[Value],%[Value]\n\t"
-			"pcpyld %[Result],%[Result],%[Result]"
-			: [Result] "=r" (result)
+			"pextlw	%[Result],%[Value],%[Value]\n\t"
+			"pcpyld	%[Result],%[Result],%[Result]"
+			: [Result] "=r" (result.v)
 			: [Value] "r" (v)
 		);
 
 		return result;
+#else
+		return mm_set_epi32(v, v, v, v);
+#endif
 	}
 
 	/// @brief Broadcast Word
@@ -3077,15 +4434,19 @@ extern "C" {
 	/// @return 128-value with broadcasted values
 	FORCEINLINE PURE m128i64 mm_broadcast_epi64(int64_t v)
 	{
-		m128i64 result;
+#ifdef PS2INTRIN_UNSAFE
+		m128i64 result = {};
 
 		asm(
-			"pcpyld %[Result],%[Value],%[Value]"
-			: [Result] "=r" (result)
+			"pcpyld	%[Result],%[Value],%[Value]"
+			: [Result] "=r" (result.v)
 			: [Value] "r" (v)
 		);
 
 		return result;
+#else
+		return mm_set_epi64(v, v);
+#endif
 	}
 
 	/// @brief Broadcast Doubleword
@@ -3104,18 +4465,25 @@ extern "C" {
 	/// Read the entire LO register and interpret its contents as signed 16-bit integers.
 	/// 
 	/// This function reads global state (LO).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return The current LO register
-	FORCEINLINE PURE m128i16 mm_loadlo_epi16()
+	FORCEINLINE PURE m128i16 mm_loadlo_epi16(lohi_state_t* state)
 	{
-		m128i16 result;
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+		m128i16 result = {};
 
 		///	volatile for same reason as 'load_lo*'
 		asm volatile(
-			"pmflo %[Result]"
-			: [Result] "=r" (result)
+			"pmflo	%[Result]"
+			: [Result] "=r" (result.v)
 		);
 
 		return result;
+#else
+		m128i16 result = { state->lo[0], state->lo[1] };
+		return result;
+#endif
 	}
 
 	/// @brief PMFLO : Parallel Move From LO register
@@ -3123,18 +4491,11 @@ extern "C" {
 	/// Read the entire LO register and interpret its contents as unsigned 16-bit integers.
 	/// 
 	/// This function reads global state (LO).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return The current LO register
-	FORCEINLINE PURE m128u16 mm_loadlo_epu16()
+	FORCEINLINE PURE m128u16 mm_loadlo_epu16(lohi_state_t* state)
 	{
-		m128u16 result;
-
-		///	volatile for same reason as 'load_lo*'
-		asm volatile(
-			"pmflo %[Result]"
-			: [Result] "=r" (result)
-		);
-
-		return result;
+		return mm_castepu16_epi16(mm_loadlo_epi16(state));
 	}
 
 	/// @brief PMFLO : Parallel Move From LO register
@@ -3142,18 +4503,11 @@ extern "C" {
 	/// Read the entire LO register and interpret its contents as unsigned 16-bit integers.
 	/// 
 	/// This function reads global state (LO).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return The current LO register
-	FORCEINLINE PURE m128i32 mm_loadlo_epi32()
+	FORCEINLINE PURE m128i32 mm_loadlo_epi32(lohi_state_t* state)
 	{
-		m128i32 result;
-
-		///	volatile for same reason as 'load_lo*'
-		asm volatile(
-			"pmflo %[Result]"
-			: [Result] "=r" (result)
-		);
-
-		return result;
+		return mm_castepi32_epi16(mm_loadlo_epi16(state));
 	}
 
 	/// @brief PMFLO : Parallel Move From LO register
@@ -3161,92 +4515,132 @@ extern "C" {
 	/// Read the entire LO register and interpret its contents as unsigned 16-bit integers.
 	/// 
 	/// This function reads global state (LO).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return The current LO register
-	FORCEINLINE PURE m128u32 mm_loadlo_epu32()
+	FORCEINLINE PURE m128u32 mm_loadlo_epu32(lohi_state_t* state)
 	{
-		m128u32 result;
+		return mm_castepu32_epi16(mm_loadlo_epi16(state));
+	}
+
+	/// @brief PMFHI : Parallel Move From HI register
+	/// 
+	/// Read the entire HI register and interpret its contents as unsigned 16-bit integers.
+	/// 
+	/// This function reads global state (HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
+	/// @return The current HI register
+	FORCEINLINE PURE m128i16 mm_loadhi_epi16(lohi_state_t* state)
+	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+		m128i16 result = {};
+
+		///	volatile for same reason as 'load_hi*'
+		asm volatile(
+			"pmfhi	%[Result]"
+			: [Result] "=r" (result.v)
+		);
+
+		return result;
+#else
+		m128i16 result = { state->hi[0], state->hi[1] };
+		return result;
+#endif
+	}
+
+	/// @brief PMFHI : Parallel Move From HI register
+	/// 
+	/// Read the entire HI register and interpret its contents as unsigned 16-bit integers.
+	/// 
+	/// This function reads global state (HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
+	/// @return The current HI register
+	FORCEINLINE PURE m128u16 mm_loadhi_epu16(lohi_state_t* state)
+	{
+		return mm_castepu16_epi16(mm_loadhi_epi16(state));
+	}
+
+	/// @brief PMFHI : Parallel Move From HI register
+	/// 
+	/// Read the entire HI register and interpret its contents as unsigned 16-bit integers.
+	/// 
+	/// This function reads global state (HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
+	/// @return The current HI register
+	FORCEINLINE PURE m128i32 mm_loadhi_epi32(lohi_state_t* state)
+	{
+		return mm_castepi32_epi16(mm_loadhi_epi16(state));
+	}
+
+	/// @brief PMFHI : Parallel Move From HI register
+	/// 
+	/// Read the entire HI register and interpret its contents as unsigned 16-bit integers.
+	/// 
+	/// This function reads global state (HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
+	/// @return The current HI register
+	FORCEINLINE PURE m128u32 mm_loadhi_epu32(lohi_state_t* state)
+	{
+		return mm_castepu32_epi16(mm_loadhi_epi16(state));
+	}
+
+	/// @brief PMFHL.LH : Parallel Move From Hi/Lo register; Lower Halfwords
+	/// 
+	/// Copy contents of both LO and HI registers. Assume LO and HI contain 8 16-bit values
+	/// each, of which only the even positions are used. Store the 4 values from LO to positions
+	/// 0, 1, 4 and 5 of the result. The 4 values from the HI register are put in positions 2, 3,
+	/// 6 and 7. Finally, interpret the result as packed signed 16-bit integers.
+	/// 
+	/// Bitwise reordering:
+	///		Result[ 15,   0]	=	LO[ 15,   0]
+	///		Result[ 31,  16]	=	LO[ 47,  32]
+	///		Result[ 47,  32]	=	HI[ 15,   0]
+	///		Result[ 63,  48]	=	HI[ 47,  32]
+	///		Result[ 79,  64]	=	LO[ 79,  64]
+	///		Result[ 95,  80]	=	LO[111,  96]
+	///		Result[111,  96]	=	HI[ 79,  64]
+	///		Result[127, 112]	=	HI[111,  96]
+	/// 
+	/// This function reads global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
+	/// @return Rearranged values from the LO and HI registers
+	FORCEINLINE PURE m128i16 mm_loadlohi_lower_epi16(lohi_state_t* state)
+	{
+		m128i16 result = {};
+
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
 
 		///	volatile for same reason as 'load_lo*'
 		asm volatile(
-			"pmflo %[Result]"
-			: [Result] "=r" (result)
+			"pmfhl.lh	%[Result]"
+			: [Result] "=r" (result.v)
 		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
 
-		return result;
-	}
-
-	/// @brief PMFHI : Parallel Move From HI register
-	/// 
-	/// Read the entire HI register and interpret its contents as unsigned 16-bit integers.
-	/// 
-	/// This function reads global state (HI).
-	/// @return The current HI register
-	FORCEINLINE PURE m128i16 mm_loadhi_epi16()
-	{
-		m128i16 result;
-
-		///	volatile for same reason as 'load_hi*'
-		asm volatile(
-			"pmfhi %[Result]"
-			: [Result] "=r" (result)
+		asm(
+			"pmflo	%[TmpLo]\n\t"
+			"pmfhi	%[TmpHi]\n\t"
+			"pcpyld	%[StateLo0],%[StateLo1],%[StateLo0]\n\t"
+			"pcpyld	%[StateHi0],%[StateHi1],%[StateHi0]\n\t"
+			"pmtlo	%[StateLo0]\n\t"
+			"pmthi	%[StateHi0]\n\t"
+			"pmfhl.lh	%[ResultLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]\n\t"
+			"pmtlo	%[TmpLo]\n\t"
+			"pmthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=r" (result.hi)
+			: [StateLo0] "r" (state->lo[0]),
+			  [StateLo1] "r" (state->lo[1]),
+			  [StateHi0] "r" (state->hi[0]),
+			  [StateHi1] "r" (state->hi[1])
 		);
-
-		return result;
-	}
-
-	/// @brief PMFHI : Parallel Move From HI register
-	/// 
-	/// Read the entire HI register and interpret its contents as unsigned 16-bit integers.
-	/// 
-	/// This function reads global state (HI).
-	/// @return The current HI register
-	FORCEINLINE PURE m128u16 mm_loadhi_epu16()
-	{
-		m128u16 result;
-
-		///	volatile for same reason as 'load_hi*'
-		asm volatile(
-			"pmfhi %[Result]"
-			: [Result] "=r" (result)
-		);
-
-		return result;
-	}
-
-	/// @brief PMFHI : Parallel Move From HI register
-	/// 
-	/// Read the entire HI register and interpret its contents as unsigned 16-bit integers.
-	/// 
-	/// This function reads global state (HI).
-	/// @return The current HI register
-	FORCEINLINE PURE m128i32 mm_loadhi_epi32()
-	{
-		m128i32 result;
-
-		///	volatile for same reason as 'load_hi*'
-		asm volatile(
-			"pmfhi %[Result]"
-			: [Result] "=r" (result)
-		);
-
-		return result;
-	}
-
-	/// @brief PMFHI : Parallel Move From HI register
-	/// 
-	/// Read the entire HI register and interpret its contents as unsigned 16-bit integers.
-	/// 
-	/// This function reads global state (HI).
-	/// @return The current HI register
-	FORCEINLINE PURE m128u32 mm_loadhi_epu32()
-	{
-		m128u32 result;
-
-		///	volatile for same reason as 'load_hi*'
-		asm volatile(
-			"pmfhi %[Result]"
-			: [Result] "=r" (result)
-		);
+#endif
 
 		return result;
 	}
@@ -3269,50 +4663,11 @@ extern "C" {
 	///		Result[127, 112]	=	HI[111,  96]
 	/// 
 	/// This function reads global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return Rearranged values from the LO and HI registers
-	FORCEINLINE PURE m128i16 mm_loadlohi_lower_epi16()
+	FORCEINLINE PURE m128u16 mm_loadlohi_lower_epu16(lohi_state_t* state)
 	{
-		m128i16 result;
-
-		///	volatile for same reason as 'load_lo*'
-		asm volatile(
-			"pmfhl.lh %[Result]"
-			: [Result] "=r" (result)
-		);
-
-		return result;
-	}
-
-	/// @brief PMFHL.LH : Parallel Move From Hi/Lo register; Lower Halfwords
-	/// 
-	/// Copy contents of both LO and HI registers. Assume LO and HI contain 8 16-bit values
-	/// each, of which only the even positions are used. Store the 4 values from LO to positions
-	/// 0, 1, 4 and 5 of the result. The 4 values from the HI register are put in positions 2, 3,
-	/// 6 and 7. Finally, interpret the result as packed signed 16-bit integers.
-	/// 
-	/// Bitwise reordering:
-	///		Result[ 15,   0]	=	LO[ 15,   0]
-	///		Result[ 31,  16]	=	LO[ 47,  32]
-	///		Result[ 47,  32]	=	HI[ 15,   0]
-	///		Result[ 63,  48]	=	HI[ 47,  32]
-	///		Result[ 79,  64]	=	LO[ 79,  64]
-	///		Result[ 95,  80]	=	LO[111,  96]
-	///		Result[111,  96]	=	HI[ 79,  64]
-	///		Result[127, 112]	=	HI[111,  96]
-	/// 
-	/// This function reads global state (LO/HI).
-	/// @return Rearranged values from the LO and HI registers
-	FORCEINLINE PURE m128u16 mm_loadlohi_lower_epu16()
-	{
-		m128u16 result;
-
-		///	volatile for same reason as 'load_lo*'
-		asm volatile(
-			"pmfhl.lh %[Result]"
-			: [Result] "=r" (result)
-		);
-
-		return result;
+		return mm_castepu16_epi16(mm_loadlohi_lower_epi16(state));
 	}
 
 	/// @brief PMFHL.SH : Parallel Move From Hi/Lo register; Saturate lower Halfwords
@@ -3333,16 +4688,45 @@ extern "C" {
 	///		Result[127, 112]	=	SaturateS16(HI[127,  96])
 	/// 
 	/// This function reads global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return Rearranged values from the LO and HI registers
-	FORCEINLINE PURE m128i16 mm_loadslohi_lower_epi16()
+	FORCEINLINE PURE m128i16 mm_loadslohi_lower_epi16(lohi_state_t* state)
 	{
-		m128i16 result;
+		m128i16 result = {};
+
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
 
 		///	volatile for same reason as 'load_lo*'
 		asm volatile(
-			"pmfhl.sh %[Result]"
-			: [Result] "=r" (result)
+			"pmfhl.sh	%[Result]"
+			: [Result] "=r" (result.v)
 		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
+
+		asm(
+			"pmflo	%[TmpLo]\n\t"
+			"pmfhi	%[TmpHi]\n\t"
+			"pcpyld	%[StateLo0],%[StateLo1],%[StateLo0]\n\t"
+			"pcpyld	%[StateHi0],%[StateHi1],%[StateHi0]\n\t"
+			"pmtlo	%[StateLo0]\n\t"
+			"pmthi	%[StateHi0]\n\t"
+			"pmfhl.sh	%[ResultLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]\n\t"
+			"pmtlo	%[TmpLo]\n\t"
+			"pmthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=r" (result.hi)
+			: [StateLo0] "r" (state->lo[0]),
+			  [StateLo1] "r" (state->lo[1]),
+			  [StateHi0] "r" (state->hi[0]),
+			  [StateHi1] "r" (state->hi[1])
+		);
+#endif
 
 		return result;
 	}
@@ -3361,16 +4745,45 @@ extern "C" {
 	///		Result[127,  96]	=	HI[ 95,  64]
 	/// 
 	/// This function reads global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return Rearranged values from the LO and HI registers
-	FORCEINLINE PURE m128i32 mm_loadlohi_lower_epi32()
+	FORCEINLINE PURE m128i32 mm_loadlohi_lower_epi32(lohi_state_t* state)
 	{
-		m128i32 result;
+		m128i32 result = {};
+
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
 
 		///	volatile for same reason as 'load_lo*'
 		asm volatile(
-			"pmfhl.lw %[Result]"
-			: [Result] "=r" (result)
+			"pmfhl.lw	%[Result]"
+			: [Result] "=r" (result.v)
 		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
+
+		asm(
+			"pmflo	%[TmpLo]\n\t"
+			"pmfhi	%[TmpHi]\n\t"
+			"pcpyld	%[StateLo0],%[StateLo1],%[StateLo0]\n\t"
+			"pcpyld	%[StateHi0],%[StateHi1],%[StateHi0]\n\t"
+			"pmtlo	%[StateLo0]\n\t"
+			"pmthi	%[StateHi0]\n\t"
+			"pmfhl.lw	%[ResultLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]\n\t"
+			"pmtlo	%[TmpLo]\n\t"
+			"pmthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=r" (result.hi)
+			: [StateLo0] "r" (state->lo[0]),
+			  [StateLo1] "r" (state->lo[1]),
+			  [StateHi0] "r" (state->hi[0]),
+			  [StateHi1] "r" (state->hi[1])
+		);
+#endif
 
 		return result;
 	}
@@ -3389,18 +4802,11 @@ extern "C" {
 	///		Result[127,  96]	=	HI[ 95,  64]
 	/// 
 	/// This function reads global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return Rearranged values from the LO and HI registers
-	FORCEINLINE PURE m128u32 mm_loadlohi_lower_epu32()
+	FORCEINLINE PURE m128u32 mm_loadlohi_lower_epu32(lohi_state_t* state)
 	{
-		m128u32 result;
-
-		///	volatile for same reason as 'load_lo*'
-		asm volatile(
-			"pmfhl.lw %[Result]"
-			: [Result] "=r" (result)
-		);
-
-		return result;
+		return mm_castepu32_epi32(mm_loadlohi_lower_epi32(state));
 	}
 
 	/// @brief PMFHL.SLW : Parallel Move From Hi/Lo register; Saturate lower Words
@@ -3416,16 +4822,45 @@ extern "C" {
 	///		Result[127,  64]	=	SaturateS32(HI[95, 64] | LO[95, 64])
 	/// 
 	/// This function reads global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return Rearranged values from the LO and HI registers
-	FORCEINLINE PURE m128i64 mm_loadslohi_lower_epi64()
+	FORCEINLINE PURE m128i64 mm_loadslohi_lower_epi64(lohi_state_t* state)
 	{
-		m128i64 result;
+		m128i64 result = {};
+
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
 
 		///	volatile for same reason as 'load_lo*'
 		asm volatile(
-			"pmfhl.slw %[Result]"
-			: [Result] "=r" (result)
+			"pmfhl.slw	%[Result]"
+			: [Result] "=r" (result.v)
 		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
+
+		asm(
+			"pmflo	%[TmpLo]\n\t"
+			"pmfhi	%[TmpHi]\n\t"
+			"pcpyld	%[StateLo0],%[StateLo1],%[StateLo0]\n\t"
+			"pcpyld	%[StateHi0],%[StateHi1],%[StateHi0]\n\t"
+			"pmtlo	%[StateLo0]\n\t"
+			"pmthi	%[StateHi0]\n\t"
+			"pmfhl.slw	%[ResultLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]\n\t"
+			"pmtlo	%[TmpLo]\n\t"
+			"pmthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=r" (result.hi)
+			: [StateLo0] "r" (state->lo[0]),
+			  [StateLo1] "r" (state->lo[1]),
+			  [StateHi0] "r" (state->hi[0]),
+			  [StateHi1] "r" (state->hi[1])
+		);
+#endif
 
 		return result;
 	}
@@ -3444,16 +4879,45 @@ extern "C" {
 	///		Result[127,  96]	=	HI[127,  96]
 	/// 
 	/// This function reads global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return Rearranged values from the LO and HI registers
-	FORCEINLINE PURE m128i32 mm_loadlohi_upper_epi32()
+	FORCEINLINE PURE m128i32 mm_loadlohi_upper_epi32(lohi_state_t* state)
 	{
-		m128i32 result;
+		m128i32 result = {};
+
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
 
 		///	volatile for same reason as 'load_lo*'
 		asm volatile(
-			"pmfhl.uw %[Result]"
-			: [Result] "=r" (result)
+			"pmfhl.uw	%[Result]"
+			: [Result] "=r" (result.v)
 		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
+
+		asm(
+			"pmflo	%[TmpLo]\n\t"
+			"pmfhi	%[TmpHi]\n\t"
+			"pcpyld	%[StateLo0],%[StateLo1],%[StateLo0]\n\t"
+			"pcpyld	%[StateHi0],%[StateHi1],%[StateHi0]\n\t"
+			"pmtlo	%[StateLo0]\n\t"
+			"pmthi	%[StateHi0]\n\t"
+			"pmfhl.uw	%[ResultLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]\n\t"
+			"pmtlo	%[TmpLo]\n\t"
+			"pmthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=r" (result.hi)
+			: [StateLo0] "r" (state->lo[0]),
+			  [StateLo1] "r" (state->lo[1]),
+			  [StateHi0] "r" (state->hi[0]),
+			  [StateHi1] "r" (state->hi[1])
+		);
+#endif
 
 		return result;
 	}
@@ -3472,242 +4936,193 @@ extern "C" {
 	///		Result[127,  96]	=	HI[127,  96]
 	/// 
 	/// This function reads global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @return Rearranged values from the LO and HI registers
-	FORCEINLINE PURE m128u32 mm_loadlohi_upper_epu32()
+	FORCEINLINE PURE m128u32 mm_loadlohi_upper_epu32(lohi_state_t* state)
 	{
-		m128u32 result;
-
-		///	volatile for same reason as 'load_lo*'
-		asm volatile(
-			"pmfhl.uw %[Result]"
-			: [Result] "=r" (result)
-		);
-
-		return result;
+		return mm_castepu32_epi32(mm_loadlohi_upper_epi32(state));
 	}
 
 	/// @brief PMTLO : Parallel Move To LO register
 	/// 
 	/// Store 8 signed 16-bit values to the LO register.
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param v Value to store to LO
-	FORCEINLINE void mm_storelo_epi16(m128i16 v)
+	FORCEINLINE void mm_storelo_epi16(lohi_state_t* state, m128i16 v)
 	{
+#ifdef PS2INTRIN_UNSAFE
 		// volatile for same reason as store_lo*
 		asm volatile(
-			"pmtlo %[Value]"
+			"pmtlo	%[Value]"
 			:
-			: [Value] "r" (v)
+			: [Value] "r" (v.v)
+			: "lo"
 		);
+#else
+		state->lo[0] = v.lo;
+		state->lo[1] = v.hi;
+#endif
 	}
 
 	/// @brief PMTLO : Parallel Move To LO register
 	/// 
 	/// Store 8 unsigned 16-bit values to the LO register.
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param v Value to store to LO
-	FORCEINLINE void mm_storelo_epu16(m128u16 v)
+	FORCEINLINE void mm_storelo_epu16(lohi_state_t* state, m128u16 v)
 	{
-		// volatile for same reason as store_lo*
-		asm volatile(
-			"pmtlo %[Value]"
-			:
-			: [Value] "r" (v)
-		);
+		mm_storelo_epi16(state, mm_castepi16_epu16(v));
 	}
 
 	/// @brief PMTLO : Parallel Move To LO register
 	/// 
 	/// Store 4 signed 32-bit values to the LO register.
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param v Value to store to LO
-	FORCEINLINE void mm_storelo_epi32(m128i32 v)
+	FORCEINLINE void mm_storelo_epi32(lohi_state_t* state, m128i32 v)
 	{
-		// volatile for same reason as store_lo*
-		asm volatile(
-			"pmtlo %[Value]"
-			:
-			: [Value] "r" (v)
-		);
+		mm_storelo_epi16(state, mm_castepi16_epi32(v));
 	}
 
 	/// @brief PMTLO : Parallel Move To LO register
 	/// 
 	/// Store 4 unsigned 32-bit values to the LO register.
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param v Value to store to LO
-	FORCEINLINE void mm_storelo_epu32(m128u32 v)
+	FORCEINLINE void mm_storelo_epu32(lohi_state_t* state, m128u32 v)
 	{
-		// volatile for same reason as store_lo*
-		asm volatile(
-			"pmtlo %[Value]"
-			:
-			: [Value] "r" (v)
-		);
+		mm_storelo_epi16(state, mm_castepi16_epu32(v));
 	}
 
 	/// @brief PMTLO : Parallel Move To LO register
 	/// 
 	/// Store 2 signed 64-bit values to the LO register.
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param v Value to store to LO
-	FORCEINLINE void mm_storelo_epi64(m128i64 v)
+	FORCEINLINE void mm_storelo_epi64(lohi_state_t* state, m128i64 v)
 	{
-		// volatile for same reason as store_lo*
-		asm volatile(
-			"pmtlo %[Value]"
-			:
-			: [Value] "r" (v)
-		);
+		mm_storelo_epi16(state, mm_castepi16_epi64(v));
 	}
 
 	/// @brief PMTLO : Parallel Move To LO register
 	/// 
 	/// Store 2 unsigned 64-bit values to the LO register.
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param v Value to store to LO
-	FORCEINLINE void mm_storelo_epu64(m128u64 v)
+	FORCEINLINE void mm_storelo_epu64(lohi_state_t* state, m128u64 v)
 	{
-		// volatile for same reason as store_lo*
-		asm volatile(
-			"pmtlo %[Value]"
-			:
-			: [Value] "r" (v)
-		);
+		mm_storelo_epi16(state, mm_castepi16_epu64(v));
 	}
 
 	/// @brief PMTLO : Parallel Move To LO register
 	/// 
 	/// Store 1 signed 128-bit value to the LO register.
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param v Value to store to LO
-	FORCEINLINE void mm_storelo_epi128(m128i128 v)
+	FORCEINLINE void mm_storelo_epi128(lohi_state_t* state, m128i128 v)
 	{
-		// volatile for same reason as store_lo*
-		asm volatile(
-			"pmtlo %[Value]"
-			:
-			: [Value] "r" (v)
-		);
+		mm_storelo_epi16(state, mm_castepi16_epi128(v));
 	}
 
 	/// @brief PMTLO : Parallel Move To LO register
 	/// 
 	/// Store 1 unsigned 128-bit value to the LO register.
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param v Value to store to LO
-	FORCEINLINE void mm_storelo_epu128(m128u128 v)
+	FORCEINLINE void mm_storelo_epu128(lohi_state_t* state, m128u128 v)
 	{
-		// volatile for same reason as store_lo*
-		asm volatile(
-			"pmtlo %[Value]"
-			:
-			: [Value] "r" (v)
-		);
+		mm_storelo_epi16(state, mm_castepi16_epu128(v));
 	}
 
 	/// @brief PMTHI : Parallel Move To HI register
 	/// 
 	/// Store 8 signed 16-bit values to the HI register.
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param v Value to store to HI
-	FORCEINLINE void mm_storehi_epi16(m128i16 v)
+	FORCEINLINE void mm_storehi_epi16(lohi_state_t* state, m128i16 v)
 	{
+#ifdef PS2INTRIN_UNSAFE
 		// volatile for same reason as store_hi*
 		asm volatile(
-			"pmthi %[Value]"
+			"pmthi	%[Value]"
 			:
-			: [Value] "r" (v)
+			: [Value] "r" (v.v)
+			: "hi"
 		);
+#else
+		state->hi[0] = v.lo;
+		state->hi[1] = v.hi;
+#endif
 	}
 
 	/// @brief PMTHI : Parallel Move To HI register
 	/// 
 	/// Store 8 unsigned 16-bit values to the HI register.
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param v Value to store to HI
-	FORCEINLINE void mm_storehi_epu16(m128u16 v)
+	FORCEINLINE void mm_storehi_epu16(lohi_state_t* state, m128u16 v)
 	{
-		// volatile for same reason as store_hi*
-		asm volatile(
-			"pmthi %[Value]"
-			:
-			: [Value] "r" (v)
-		);
+		mm_storehi_epi16(state, mm_castepi16_epu16(v));
 	}
 
 	/// @brief PMTHI : Parallel Move To HI register
 	/// 
 	/// Store 4 signed 32-bit values to the HI register.
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param v Value to store to HI
-	FORCEINLINE void mm_storehi_epi32(m128i32 v)
+	FORCEINLINE void mm_storehi_epi32(lohi_state_t* state, m128i32 v)
 	{
-		// volatile for same reason as store_hi*
-		asm volatile(
-			"pmthi %[Value]"
-			:
-			: [Value] "r" (v)
-		);
+		mm_storehi_epi16(state, mm_castepi16_epi32(v));
 	}
 
 	/// @brief PMTHI : Parallel Move To HI register
 	/// 
 	/// Store 4 unsigned 32-bit values to the HI register.
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param v Value to store to HI
-	FORCEINLINE void mm_storehi_epu32(m128u32 v)
+	FORCEINLINE void mm_storehi_epu32(lohi_state_t* state, m128u32 v)
 	{
-		// volatile for same reason as store_hi*
-		asm volatile(
-			"pmthi %[Value]"
-			:
-			: [Value] "r" (v)
-		);
+		mm_storehi_epi16(state, mm_castepi16_epu32(v));
 	}
 
 	/// @brief PMTHI : Parallel Move To HI register
 	/// 
 	/// Store 2 signed 64-bit values to the HI register.
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param v Value to store to HI
-	FORCEINLINE void mm_storehi_epi64(m128i64 v)
+	FORCEINLINE void mm_storehi_epi64(lohi_state_t* state, m128i64 v)
 	{
-		// volatile for same reason as store_hi*
-		asm volatile(
-			"pmthi %[Value]"
-			:
-			: [Value] "r" (v)
-		);
+		mm_storehi_epi16(state, mm_castepi16_epi64(v));
 	}
 
 	/// @brief PMTHI : Parallel Move To HI register
 	/// 
 	/// Store 2 unsigned 64-bit values to the HI register.
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param v Value to store to HI
-	FORCEINLINE void mm_storehi_epu64(m128u64 v)
+	FORCEINLINE void mm_storehi_epu64(lohi_state_t* state, m128u64 v)
 	{
-		// volatile for same reason as store_hi*
-		asm volatile(
-			"pmthi %[Value]"
-			:
-			: [Value] "r" (v)
-		);
+		mm_storehi_epi16(state, mm_castepi16_epu64(v));
 	}
 
 	/// @brief PMTHI : Parallel Move To HI register
 	/// 
 	/// Store 1 signed 128-bit value to the HI register.
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param v Value to store to HI
-	FORCEINLINE void mm_storehi_epi128(m128i128 v)
+	FORCEINLINE void mm_storehi_epi128(lohi_state_t* state, m128i128 v)
 	{
-		// volatile for same reason as store_hi*
-		asm volatile(
-			"pmthi %[Value]"
-			:
-			: [Value] "r" (v)
-		);
+		mm_storehi_epi16(state, mm_castepi16_epi128(v));
 	}
 
 	/// @brief PMTHI : Parallel Move To HI register
 	/// 
 	/// Store 1 unsigned 128-bit value to the HI register.
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param v Value to store to HI
-	FORCEINLINE void mm_storehi_epu128(m128u128 v)
+	FORCEINLINE void mm_storehi_epu128(lohi_state_t* state, m128u128 v)
 	{
-		// volatile for same reason as store_hi*
-		asm volatile(
-			"pmthi %[Value]"
-			:
-		: [Value] "r" (v)
-			);
+		mm_storehi_epi16(state, mm_castepi16_epu128(v));
 	}
 
 	/// @brief PMTHL.LW : Parallel Move To Hi/Lo register; Lower Words
@@ -3721,15 +5136,49 @@ extern "C" {
 	///		HI[ 31,   0]	=	Value[ 63,  32]
 	///		LO[ 95,  64]	=	Value[ 95,  64]
 	///		HI[ 95,  64]	=	Value[127,  96]
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param v Packed values to store to LO and HI registers
-	FORCEINLINE void mm_storelohi_epi32(m128i32 v)
+	FORCEINLINE void mm_storelohi_epi32(lohi_state_t* state, m128i32 v)
 	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
 		// volatile for same reason as store_lo*
 		asm volatile(
-			"pmthl.lw %[Value]"
+			"pmthl.lw	%[Value]"
 			:
-			: [Value] "r" (v)
+			: [Value] "r" (v.v)
+			: "lo", "hi"
 		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
+
+		asm(
+			"pmflo	%[TmpLo]\n\t"
+			"pmfhi	%[TmpHi]\n\t"
+			"pcpyld	%[StateLo0],%[StateLo1],%[StateLo0]\n\t"
+			"pcpyld	%[StateHi0],%[StateHi1],%[StateHi0]\n\t"
+			"pmtlo	%[StateLo0]\n\t"
+			"pmthi	%[StateHi0]\n\t"
+			"pcpyld	%[ValueLo],%[ValueHi],%[ValueLo]\n\t"
+			"pmthl.lw	%[ValueLo]\n\t"
+			"pmflo	%[StateLo0]\n\t"
+			"pmfhi	%[StateHi0]\n\t"
+			"pcpyud	%[StateLo1],%[StateLo0],%[StateLo0]\n\t"
+			"pcpyud	%[StateHi1],%[StateHi0],%[StateHi0]\n\t"
+			"pmtlo	%[TmpLo]\n\t"
+			"pmthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [StateLo0] "+r" (state->lo[0]),
+			  [StateLo1] "+r" (state->lo[1]),
+			  [StateHi0] "+r" (state->hi[0]),
+			  [StateHi1] "+r" (state->hi[1])
+			: [ValueLo] "r" (v.lo),
+			  [ValueHi] "r" (v.hi)
+		);
+#endif
 	}
 
 	/// @brief PMTHL.LW : Parallel Move To Hi/Lo register; Lower Words
@@ -3743,15 +5192,11 @@ extern "C" {
 	///		HI[ 31,   0]	=	Value[ 63,  32]
 	///		LO[ 95,  64]	=	Value[ 95,  64]
 	///		HI[ 95,  64]	=	Value[127,  96]
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param v Packed values to store to LO and HI registers
-	FORCEINLINE void mm_storelohi_epu32(m128u32 v)
+	FORCEINLINE void mm_storelohi_epu32(lohi_state_t* state, m128u32 v)
 	{
-		// volatile for same reason as store_lo*
-		asm volatile(
-			"pmthl.lw %[Value]"
-			:
-			: [Value] "r" (v)
-		);
+		mm_storelohi_epi32(state, mm_castepi32_epu32(v));
 	}
 
 
@@ -3763,12 +5208,18 @@ extern "C" {
 	/// @return Bitwise-AND of both operands
 	FORCEINLINE CONST m128i8 mm_and_epi8(m128i8 l, m128i8 r)
 	{
-		m128i8 result;
+		m128i8 result = {};
 
-		asm("pand %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+#ifdef PS2INTRIN_UNSAFE
+		asm("pand	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		result.lo = l.lo & r.lo;
+		result.hi = l.hi & r.hi;
+#endif
 
 		return result;
 	}
@@ -3781,14 +5232,7 @@ extern "C" {
 	/// @return Bitwise-AND of both operands
 	FORCEINLINE CONST m128u8 mm_and_epu8(m128u8 l, m128u8 r)
 	{
-		m128u8 result;
-
-		asm("pand %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu8_epi8(mm_and_epi8(mm_castepi8_epu8(l), mm_castepi8_epu8(r)));
 	}
 
 	/// @brief PAND : Parallel AND
@@ -3799,14 +5243,7 @@ extern "C" {
 	/// @return Bitwise-AND of both operands
 	FORCEINLINE CONST m128i16 mm_and_epi16(m128i16 l, m128i16 r)
 	{
-		m128i16 result;
-
-		asm("pand %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepi16_epi8(mm_and_epi8(mm_castepi8_epi16(l), mm_castepi8_epi16(r)));
 	}
 
 	/// @brief PAND : Parallel AND
@@ -3817,14 +5254,7 @@ extern "C" {
 	/// @return Bitwise-AND of both operands
 	FORCEINLINE CONST m128u16 mm_and_epu16(m128u16 l, m128u16 r)
 	{
-		m128u16 result;
-
-		asm("pand %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu16_epi8(mm_and_epi8(mm_castepi8_epu16(l), mm_castepi8_epu16(r)));
 	}
 
 	/// @brief PAND : Parallel AND
@@ -3835,14 +5265,7 @@ extern "C" {
 	/// @return Bitwise-AND of both operands
 	FORCEINLINE CONST m128i32 mm_and_epi32(m128i32 l, m128i32 r)
 	{
-		m128i32 result;
-
-		asm("pand %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepi32_epi8(mm_and_epi8(mm_castepi8_epi32(l), mm_castepi8_epi32(r)));
 	}
 
 	/// @brief PAND : Parallel AND
@@ -3853,14 +5276,7 @@ extern "C" {
 	/// @return Bitwise-AND of both operands
 	FORCEINLINE CONST m128u32 mm_and_epu32(m128u32 l, m128u32 r)
 	{
-		m128u32 result;
-
-		asm("pand %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu32_epi8(mm_and_epi8(mm_castepi8_epu32(l), mm_castepi8_epu32(r)));
 	}
 
 	/// @brief PAND : Parallel AND
@@ -3871,14 +5287,7 @@ extern "C" {
 	/// @return Bitwise-AND of both operands
 	FORCEINLINE CONST m128i64 mm_and_epi64(m128i64 l, m128i64 r)
 	{
-		m128i64 result;
-
-		asm("pand %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepi64_epi8(mm_and_epi8(mm_castepi8_epi64(l), mm_castepi8_epi64(r)));
 	}
 
 	/// @brief PAND : Parallel AND
@@ -3889,14 +5298,7 @@ extern "C" {
 	/// @return Bitwise-AND of both operands
 	FORCEINLINE CONST m128u64 mm_and_epu64(m128u64 l, m128u64 r)
 	{
-		m128u64 result;
-
-		asm("pand %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu64_epi8(mm_and_epi8(mm_castepi8_epu64(l), mm_castepi8_epu64(r)));
 	}
 
 	/// @brief PAND : Parallel AND
@@ -3907,14 +5309,7 @@ extern "C" {
 	/// @return Bitwise-AND of both operands
 	FORCEINLINE CONST m128i128 mm_and_epi128(m128i128 l, m128i128 r)
 	{
-		m128i128 result;
-
-		asm("pand %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepi128_epi8(mm_and_epi8(mm_castepi8_epi128(l), mm_castepi8_epi128(r)));
 	}
 
 	/// @brief PAND : Parallel AND
@@ -3925,14 +5320,7 @@ extern "C" {
 	/// @return Bitwise-AND of both operands
 	FORCEINLINE CONST m128u128 mm_and_epu128(m128u128 l, m128u128 r)
 	{
-		m128u128 result;
-
-		asm("pand %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu128_epi8(mm_and_epi8(mm_castepi8_epu128(l), mm_castepi8_epu128(r)));
 	}
 
 
@@ -3944,12 +5332,18 @@ extern "C" {
 	/// @return Bitwise-OR of both operands
 	FORCEINLINE CONST m128i8 mm_or_epi8(m128i8 l, m128i8 r)
 	{
-		m128i8 result;
+		m128i8 result = {};
 
-		asm("por %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+#ifdef PS2INTRIN_UNSAFE
+		asm("por	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		result.lo = l.lo | r.lo;
+		result.hi = l.hi | r.hi;
+#endif
 
 		return result;
 	}
@@ -3962,14 +5356,7 @@ extern "C" {
 	/// @return Bitwise-OR of both operands
 	FORCEINLINE CONST m128u8 mm_or_epu8(m128u8 l, m128u8 r)
 	{
-		m128u8 result;
-
-		asm("por %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu8_epi8(mm_or_epi8(mm_castepi8_epu8(l), mm_castepi8_epu8(r)));
 	}
 
 	/// @brief POR : Parallel OR
@@ -3980,14 +5367,7 @@ extern "C" {
 	/// @return Bitwise-OR of both operands
 	FORCEINLINE CONST m128i16 mm_or_epi16(m128i16 l, m128i16 r)
 	{
-		m128i16 result;
-
-		asm("por %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepi16_epi8(mm_or_epi8(mm_castepi8_epi16(l), mm_castepi8_epi16(r)));
 	}
 
 	/// @brief POR : Parallel OR
@@ -3998,14 +5378,7 @@ extern "C" {
 	/// @return Bitwise-OR of both operands
 	FORCEINLINE CONST m128u16 mm_or_epu16(m128u16 l, m128u16 r)
 	{
-		m128u16 result;
-
-		asm("por %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu16_epi8(mm_or_epi8(mm_castepi8_epu16(l), mm_castepi8_epu16(r)));
 	}
 
 	/// @brief POR : Parallel OR
@@ -4016,14 +5389,7 @@ extern "C" {
 	/// @return Bitwise-OR of both operands
 	FORCEINLINE CONST m128i32 mm_or_epi32(m128i32 l, m128i32 r)
 	{
-		m128i32 result;
-
-		asm("por %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepi32_epi8(mm_or_epi8(mm_castepi8_epi32(l), mm_castepi8_epi32(r)));
 	}
 
 	/// @brief POR : Parallel OR
@@ -4034,14 +5400,7 @@ extern "C" {
 	/// @return Bitwise-OR of both operands
 	FORCEINLINE CONST m128u32 mm_or_epu32(m128u32 l, m128u32 r)
 	{
-		m128u32 result;
-
-		asm("por %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu32_epi8(mm_or_epi8(mm_castepi8_epu32(l), mm_castepi8_epu32(r)));
 	}
 
 	/// @brief POR : Parallel OR
@@ -4052,14 +5411,7 @@ extern "C" {
 	/// @return Bitwise-OR of both operands
 	FORCEINLINE CONST m128i64 mm_or_epi64(m128i64 l, m128i64 r)
 	{
-		m128i64 result;
-
-		asm("por %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepi64_epi8(mm_or_epi8(mm_castepi8_epi64(l), mm_castepi8_epi64(r)));
 	}
 
 	/// @brief POR : Parallel OR
@@ -4070,14 +5422,7 @@ extern "C" {
 	/// @return Bitwise-OR of both operands
 	FORCEINLINE CONST m128u64 mm_or_epu64(m128u64 l, m128u64 r)
 	{
-		m128u64 result;
-
-		asm("por %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu64_epi8(mm_or_epi8(mm_castepi8_epu64(l), mm_castepi8_epu64(r)));
 	}
 
 	/// @brief POR : Parallel OR
@@ -4088,14 +5433,7 @@ extern "C" {
 	/// @return Bitwise-OR of both operands
 	FORCEINLINE CONST m128i128 mm_or_epi128(m128i128 l, m128i128 r)
 	{
-		m128i128 result;
-
-		asm("por %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepi128_epi8(mm_or_epi8(mm_castepi8_epi128(l), mm_castepi8_epi128(r)));
 	}
 
 	/// @brief POR : Parallel OR
@@ -4106,14 +5444,7 @@ extern "C" {
 	/// @return Bitwise-OR of both operands
 	FORCEINLINE CONST m128u128 mm_or_epu128(m128u128 l, m128u128 r)
 	{
-		m128u128 result;
-
-		asm("por %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu128_epi8(mm_or_epi8(mm_castepi8_epu128(l), mm_castepi8_epu128(r)));
 	}
 
 
@@ -4125,12 +5456,18 @@ extern "C" {
 	/// @return Bitwise-XOR of both operands
 	FORCEINLINE CONST m128i8 mm_xor_epi8(m128i8 l, m128i8 r)
 	{
-		m128i8 result;
+		m128i8 result = {};
 
-		asm("pxor %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+#ifdef PS2INTRIN_UNSAFE
+		asm("pxor	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		result.lo = l.lo ^ r.lo;
+		result.hi = l.hi ^ r.hi;
+#endif
 
 		return result;
 	}
@@ -4143,14 +5480,7 @@ extern "C" {
 	/// @return Bitwise-XOR of both operands
 	FORCEINLINE CONST m128u8 mm_xor_epu8(m128u8 l, m128u8 r)
 	{
-		m128u8 result;
-
-		asm("pxor %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu8_epi8(mm_xor_epi8(mm_castepi8_epu8(l), mm_castepi8_epu8(r)));
 	}
 
 	/// @brief PXOR : Parallel XOR
@@ -4161,14 +5491,7 @@ extern "C" {
 	/// @return Bitwise-XOR of both operands
 	FORCEINLINE CONST m128i16 mm_xor_epi16(m128i16 l, m128i16 r)
 	{
-		m128i16 result;
-
-		asm("pxor %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepi16_epi8(mm_xor_epi8(mm_castepi8_epi16(l), mm_castepi8_epi16(r)));
 	}
 
 	/// @brief PXOR : Parallel XOR
@@ -4179,14 +5502,7 @@ extern "C" {
 	/// @return Bitwise-XOR of both operands
 	FORCEINLINE CONST m128u16 mm_xor_epu16(m128u16 l, m128u16 r)
 	{
-		m128u16 result;
-
-		asm("pxor %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu16_epi8(mm_xor_epi8(mm_castepi8_epu16(l), mm_castepi8_epu16(r)));
 	}
 
 	/// @brief PXOR : Parallel XOR
@@ -4197,14 +5513,7 @@ extern "C" {
 	/// @return Bitwise-XOR of both operands
 	FORCEINLINE CONST m128i32 mm_xor_epi32(m128i32 l, m128i32 r)
 	{
-		m128i32 result;
-
-		asm("pxor %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepi32_epi8(mm_xor_epi8(mm_castepi8_epi32(l), mm_castepi8_epi32(r)));
 	}
 
 	/// @brief PXOR : Parallel XOR
@@ -4215,14 +5524,7 @@ extern "C" {
 	/// @return Bitwise-XOR of both operands
 	FORCEINLINE CONST m128u32 mm_xor_epu32(m128u32 l, m128u32 r)
 	{
-		m128u32 result;
-
-		asm("pxor %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu32_epi8(mm_xor_epi8(mm_castepi8_epu32(l), mm_castepi8_epu32(r)));
 	}
 
 	/// @brief PXOR : Parallel XOR
@@ -4233,14 +5535,7 @@ extern "C" {
 	/// @return Bitwise-XOR of both operands
 	FORCEINLINE CONST m128i64 mm_xor_epi64(m128i64 l, m128i64 r)
 	{
-		m128i64 result;
-
-		asm("pxor %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepi64_epi8(mm_xor_epi8(mm_castepi8_epi64(l), mm_castepi8_epi64(r)));
 	}
 
 	/// @brief PXOR : Parallel XOR
@@ -4251,14 +5546,7 @@ extern "C" {
 	/// @return Bitwise-XOR of both operands
 	FORCEINLINE CONST m128u64 mm_xor_epu64(m128u64 l, m128u64 r)
 	{
-		m128u64 result;
-
-		asm("pxor %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu64_epi8(mm_xor_epi8(mm_castepi8_epu64(l), mm_castepi8_epu64(r)));
 	}
 
 	/// @brief PXOR : Parallel XOR
@@ -4269,14 +5557,7 @@ extern "C" {
 	/// @return Bitwise-XOR of both operands
 	FORCEINLINE CONST m128i128 mm_xor_epi128(m128i128 l, m128i128 r)
 	{
-		m128i128 result;
-
-		asm("pxor %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepi128_epi8(mm_xor_epi8(mm_castepi8_epi128(l), mm_castepi8_epi128(r)));
 	}
 
 	/// @brief PXOR : Parallel XOR
@@ -4287,14 +5568,7 @@ extern "C" {
 	/// @return Bitwise-XOR of both operands
 	FORCEINLINE CONST m128u128 mm_xor_epu128(m128u128 l, m128u128 r)
 	{
-		m128u128 result;
-
-		asm("pxor %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu128_epi8(mm_xor_epi8(mm_castepi8_epu128(l), mm_castepi8_epu128(r)));
 	}
 
 
@@ -4306,12 +5580,18 @@ extern "C" {
 	/// @return Bitwise-NOR of both operands
 	FORCEINLINE CONST m128i8 mm_nor_epi8(m128i8 l, m128i8 r)
 	{
-		m128i8 result;
+		m128i8 result = {};
 
-		asm("pnor %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+#ifdef PS2INTRIN_UNSAFE
+		asm("pnor	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		result.lo = ~(l.lo | r.lo);
+		result.hi = ~(l.hi | r.hi);
+#endif
 
 		return result;
 	}
@@ -4324,14 +5604,7 @@ extern "C" {
 	/// @return Bitwise-NOR of both operands
 	FORCEINLINE CONST m128u8 mm_nor_epu8(m128u8 l, m128u8 r)
 	{
-		m128u8 result;
-
-		asm("pnor %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu8_epi8(mm_nor_epi8(mm_castepi8_epu8(l), mm_castepi8_epu8(r)));
 	}
 
 	/// @brief PNOR : Parallel NOR
@@ -4342,14 +5615,7 @@ extern "C" {
 	/// @return Bitwise-NOR of both operands
 	FORCEINLINE CONST m128i16 mm_nor_epi16(m128i16 l, m128i16 r)
 	{
-		m128i16 result;
-
-		asm("pnor %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepi16_epi8(mm_nor_epi8(mm_castepi8_epi16(l), mm_castepi8_epi16(r)));
 	}
 
 	/// @brief PNOR : Parallel NOR
@@ -4360,14 +5626,7 @@ extern "C" {
 	/// @return Bitwise-NOR of both operands
 	FORCEINLINE CONST m128u16 mm_nor_epu16(m128u16 l, m128u16 r)
 	{
-		m128u16 result;
-
-		asm("pnor %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu16_epi8(mm_nor_epi8(mm_castepi8_epu16(l), mm_castepi8_epu16(r)));
 	}
 
 	/// @brief PNOR : Parallel NOR
@@ -4378,14 +5637,7 @@ extern "C" {
 	/// @return Bitwise-NOR of both operands
 	FORCEINLINE CONST m128i32 mm_nor_epi32(m128i32 l, m128i32 r)
 	{
-		m128i32 result;
-
-		asm("pnor %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepi32_epi8(mm_nor_epi8(mm_castepi8_epi32(l), mm_castepi8_epi32(r)));
 	}
 
 	/// @brief PNOR : Parallel NOR
@@ -4396,14 +5648,7 @@ extern "C" {
 	/// @return Bitwise-NOR of both operands
 	FORCEINLINE CONST m128u32 mm_nor_epu32(m128u32 l, m128u32 r)
 	{
-		m128u32 result;
-
-		asm("pnor %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu32_epi8(mm_nor_epi8(mm_castepi8_epu32(l), mm_castepi8_epu32(r)));
 	}
 
 	/// @brief PNOR : Parallel NOR
@@ -4414,14 +5659,7 @@ extern "C" {
 	/// @return Bitwise-NOR of both operands
 	FORCEINLINE CONST m128i64 mm_nor_epi64(m128i64 l, m128i64 r)
 	{
-		m128i64 result;
-
-		asm("pnor %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepi64_epi8(mm_nor_epi8(mm_castepi8_epi64(l), mm_castepi8_epi64(r)));
 	}
 
 	/// @brief PNOR : Parallel NOR
@@ -4432,14 +5670,7 @@ extern "C" {
 	/// @return Bitwise-NOR of both operands
 	FORCEINLINE CONST m128u64 mm_nor_epu64(m128u64 l, m128u64 r)
 	{
-		m128u64 result;
-
-		asm("pnor %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu64_epi8(mm_nor_epi8(mm_castepi8_epu64(l), mm_castepi8_epu64(r)));
 	}
 
 	/// @brief PNOR : Parallel NOR
@@ -4450,14 +5681,7 @@ extern "C" {
 	/// @return Bitwise-NOR of both operands
 	FORCEINLINE CONST m128i128 mm_nor_epi128(m128i128 l, m128i128 r)
 	{
-		m128i128 result;
-
-		asm("pnor %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepi128_epi8(mm_nor_epi8(mm_castepi8_epi128(l), mm_castepi8_epi128(r)));
 	}
 
 	/// @brief PNOR : Parallel NOR
@@ -4468,14 +5692,7 @@ extern "C" {
 	/// @return Bitwise-NOR of both operands
 	FORCEINLINE CONST m128u128 mm_nor_epu128(m128u128 l, m128u128 r)
 	{
-		m128u128 result;
-
-		asm("pnor %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu128_epi8(mm_nor_epi8(mm_castepi8_epu128(l), mm_castepi8_epu128(r)));
 	}
 
 
@@ -4589,13 +5806,29 @@ extern "C" {
 	/// @return Equality result mask
 	FORCEINLINE CONST m128i8 mm_cmpeq_epi8(m128i8 l, m128i8 r)
 	{
-		m128i8 result;
+		m128i8 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pceqb %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"pceqb	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LLo],%[LHi],%[LLo]\n\t"
+			"pcpyld	%[RLo],%[RHi],%[RLo]\n\t"
+			"pceqb	%[ResultLo],%[LLo],%[RLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LLo] "r" (l.lo),
+			  [LHi] "r" (l.hi),
+			  [RLo] "r" (r.lo),
+			  [RHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -4624,13 +5857,29 @@ extern "C" {
 	/// @return Comparison result mask
 	FORCEINLINE CONST m128i8 mm_cmpgt_epi8(m128i8 l, m128i8 r)
 	{
-		m128i8 result;
+		m128i8 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pcgtb %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "r" (l), [Right] "r" (r)
+			"pcgtb	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LLo],%[LHi],%[LLo]\n\t"
+			"pcpyld	%[RLo],%[RHi],%[RLo]\n\t"
+			"pcgtb	%[ResultLo],%[LLo],%[RLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LLo] "r" (l.lo),
+			  [LHi] "r" (l.hi),
+			  [RLo] "r" (r.lo),
+			  [RHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -4693,15 +5942,7 @@ extern "C" {
 	/// @return Equality result mask
 	FORCEINLINE CONST m128u8 mm_cmpeq_epu8(m128u8 l, m128u8 r)
 	{
-		m128u8 result;
-
-		asm(
-			"pceqb %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu8_epi8(mm_cmpeq_epi8(mm_castepi8_epu8(l), mm_castepi8_epu8(r)));
 	}
 
 	/// @brief PCEQB : Parallel Compare for EQual Byte
@@ -4725,13 +5966,29 @@ extern "C" {
 	/// @return Equality result mask
 	FORCEINLINE CONST m128i16 mm_cmpeq_epi16(m128i16 l, m128i16 r)
 	{
-		m128i16 result;
+		m128i16 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pceqh %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"pceqh	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LLo],%[LHi],%[LLo]\n\t"
+			"pcpyld	%[RLo],%[RHi],%[RLo]\n\t"
+			"pceqh	%[ResultLo],%[LLo],%[RLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LLo] "r" (l.lo),
+			  [LHi] "r" (l.hi),
+			  [RLo] "r" (r.lo),
+			  [RHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -4760,13 +6017,29 @@ extern "C" {
 	/// @return Comparison result mask
 	FORCEINLINE CONST m128i16 mm_cmpgt_epi16(m128i16 l, m128i16 r)
 	{
-		m128i16 result;
+		m128i16 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pcgth %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "r" (l), [Right] "r" (r)
+			"pcgth	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LLo],%[LHi],%[LLo]\n\t"
+			"pcpyld	%[RLo],%[RHi],%[RLo]\n\t"
+			"pcgth	%[ResultLo],%[LLo],%[RLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LLo] "r" (l.lo),
+			  [LHi] "r" (l.hi),
+			  [RLo] "r" (r.lo),
+			  [RHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -4829,15 +6102,7 @@ extern "C" {
 	/// @return Equality result mask
 	FORCEINLINE CONST m128u16 mm_cmpeq_epu16(m128u16 l, m128u16 r)
 	{
-		m128u16 result;
-
-		asm(
-			"pceqh %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu16_epi16(mm_cmpeq_epi16(mm_castepi16_epu16(l), mm_castepi16_epu16(r)));
 	}
 
 	/// @brief PCEQB : Parallel Compare for EQual Byte
@@ -4861,13 +6126,29 @@ extern "C" {
 	/// @return Equality result mask
 	FORCEINLINE CONST m128i32 mm_cmpeq_epi32(m128i32 l, m128i32 r)
 	{
-		m128i32 result;
+		m128i32 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pceqw %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"pceqw	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LLo],%[LHi],%[LLo]\n\t"
+			"pcpyld	%[RLo],%[RHi],%[RLo]\n\t"
+			"pceqw	%[ResultLo],%[LLo],%[RLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LLo] "r" (l.lo),
+			  [LHi] "r" (l.hi),
+			  [RLo] "r" (r.lo),
+			  [RHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -4897,13 +6178,29 @@ extern "C" {
 	/// @return Comparison result mask
 	FORCEINLINE CONST m128i32 mm_cmpgt_epi32(m128i32 l, m128i32 r)
 	{
-		m128i32 result;
+		m128i32 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pcgtw %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "r" (l), [Right] "r" (r)
+			"pcgtw	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LLo],%[LHi],%[LLo]\n\t"
+			"pcpyld	%[RLo],%[RHi],%[RLo]\n\t"
+			"pcgtw	%[ResultLo],%[LLo],%[RLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LLo] "r" (l.lo),
+			  [LHi] "r" (l.hi),
+			  [RLo] "r" (r.lo),
+			  [RHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -4966,15 +6263,7 @@ extern "C" {
 	/// @return Equality result mask
 	FORCEINLINE CONST m128u32 mm_cmpeq_epu32(m128u32 l, m128u32 r)
 	{
-		m128u32 result;
-
-		asm(
-			"pceqw %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu32_epi32(mm_cmpeq_epi32(mm_castepi32_epu32(l), mm_castepi32_epu32(r)));
 	}
 
 	/// @brief PCEQB : Parallel Compare for EQual Byte
@@ -4990,6 +6279,8 @@ extern "C" {
 	}
 
 
+	// PSLLH
+#ifdef PS2INTRIN_UNSAFE
 	/// @brief PSLLH : Parallel Shift Left Logical Halfword
 	/// 
 	/// Logically left shift 16-bit values. Shifts in '0's into the lower bits.
@@ -4998,13 +6289,36 @@ extern "C" {
 	/// @param value Variable identifier to use as source value. Must be of type 'm128i16' or
 	/// 'm128u16'
 	/// @param shift_amount Amount of bits to shift the source value left. Must be in range [0, 15]
-#define PSLLH(result, value, shift_amount)															\
+	#define PSLLH(result, value, shift_amount)														\
 		asm(																						\
-			"psllh %[Result],%[Value],%c[ShiftAmount]"												\
-			: [Result] "=r" (result)																\
-			: [Value] "r" (value), [ShiftAmount] "n" (shift_amount)									\
+			"psllh	%[Result],%[Value],%c[ShiftAmount]"												\
+			: [Result] "=r" ((result).v)															\
+			: [Value] "r" ((value).v), [ShiftAmount] "n" (shift_amount)								\
 		)
+#else
+	/// @brief PSLLH : Parallel Shift Left Logical Halfword
+	/// 
+	/// Logically left shift 16-bit values. Shifts in '0's into the lower bits.
+	/// @param result Variable identifier to store result to. Must be of type 'm128i16' or
+	/// 'm128u16'
+	/// @param value Variable identifier to use as source value. Must be of type 'm128i16' or
+	/// 'm128u16'
+	/// @param shift_amount Amount of bits to shift the source value left. Must be in range [0, 15]
+	#define PSLLH(result, value, shift_amount)														\
+		asm(																						\
+			"pcpyld	%[ResultLo],%[ValueHi],%[ValueLo]\n\t"											\
+			"psllh	%[ResultLo],%[ResultLo],%c[ShiftAmount]\n\t"									\
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"											\
+			: [ResultLo] "=r" ((result).lo),														\
+			  [ResultHi] "=&r" ((result).hi)														\
+			: [ValueLo] "r" ((value).lo),															\
+			  [ValueHi] "r" ((value).hi),															\
+			  [ShiftAmount] "n" (shift_amount)														\
+		)
+#endif
 
+	// PSLLW
+#ifdef PS2INTRIN_UNSAFE
 	/// @brief PSLLW : Parallel Shift Left Logical Word
 	/// 
 	/// Logically left shift 32-bit values. Shifts in '0's into the lower bits.
@@ -5013,12 +6327,34 @@ extern "C" {
 	/// @param value Variable identifier to use as source value. Must be of type 'm128i32' or
 	/// 'm128u32'
 	/// @param shift_amount Amount of bits to shift the source value left. Must be in range [0, 31]
-#define PSLLW(result, value, shift_amount)															\
+	#define PSLLW(result, value, shift_amount)														\
 		asm(																						\
-			"psllw %[Result],%[Value],%c[ShiftAmount]"												\
-			: [Result] "=r" (result)																\
-			: [Value] "r" (value), [ShiftAmount] "n" (shift_amount)									\
+			"psllw	%[Result],%[Value],%c[ShiftAmount]"												\
+			: [Result] "=r" ((result).v)															\
+			: [Value] "r" ((value).v),																\
+			  [ShiftAmount] "n" (shift_amount)														\
 		)
+#else
+	/// @brief PSLLW : Parallel Shift Left Logical Word
+	/// 
+	/// Logically left shift 32-bit values. Shifts in '0's into the lower bits.
+	/// @param result Variable identifier to store result to. Must be of type 'm128i32' or
+	/// 'm128u32'
+	/// @param value Variable identifier to use as source value. Must be of type 'm128i32' or
+	/// 'm128u32'
+	/// @param shift_amount Amount of bits to shift the source value left. Must be in range [0, 31]
+	#define PSLLW(result, value, shift_amount)														\
+		asm(																						\
+			"pcpyld	%[ResultLo],%[ValueHi],%[ValueLo]\n\t"											\
+			"psllw	%[ResultLo],%[ResultLo],%c[ShiftAmount]\n\t"									\
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"											\
+			: [ResultLo] "=r" ((result).lo),														\
+			  [ResultHi] "=&r" ((result).hi)														\
+			: [ValueLo] "r" ((value).lo),															\
+			  [ValueHi] "r" ((value).hi),															\
+			  [ShiftAmount] "n" (shift_amount)														\
+		)
+#endif
 
 	/// @brief PSLLVW : Parallel Shift Left Logical Variable Word
 	/// 
@@ -5030,42 +6366,101 @@ extern "C" {
 	/// @return Values shifted left by variable amount
 	FORCEINLINE CONST m128i64 mm_sllv_epi64(m128i64 value, m128u64 shift_amount)
 	{
-		m128i64 result;
+		m128i64 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"psllvw %[Result],%[Value],%[Amount]"
-			: [Result] "=r" (result)
-			: [Value] "r" (value), [Amount] "r" (shift_amount)
+			"psllvw	%[Result],%[Value],%[Amount]"
+			: [Result] "=r" (result.v)
+			: [Value] "r" (value.v),
+			  [Amount] "r" (shift_amount.v)
 		);
+#else
+		asm(
+			"pcpyld	%[ValueLo],%[ValueHi],%[ValueLo]\n\t"
+			"pcpyld	%[AmountLo],%[AmountHi],%[AmountLo]\n\t"
+			"psllvw	%[ResultLo],%[ValueLo],%[AmountLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [ValueLo] "r" (value.lo),
+			  [ValueHi] "r" (value.hi),
+			  [AmountLo] "r" (shift_amount.lo),
+			  [AmountHi] "r" (shift_amount.hi)
+		);
+#endif
 
 		return result;
 	}
 
+	// PSRAH
+#ifdef PS2INTRIN_UNSAFE
 	/// @brief PSRAH : Parallel Shift Right Arithmetic Halfword
 	/// 
 	/// Arithmetically right shift 16-bit values. Shifts in sign bits into the upper bits.
 	/// @param result Variable identifier to store result to. Must be of type 'm128i16'
 	/// @param value Variable identifier to use as source value. Must be of type 'm128i16'
 	/// @param shift_amount Amount of bits to shift the source value right. Must be in range [0, 15]
-#define PSRAH(result, value, shift_amount)															\
+	#define PSRAH(result, value, shift_amount)														\
 		asm(																						\
-			"psrah %[Result],%[Value],%c[ShiftAmount]"												\
-			: [Result] "=r" (result)																\
-			: [Value] "r" (value), [ShiftAmount] "n" (shift_amount)									\
+			"psrah	%[Result],%[Value],%c[ShiftAmount]"												\
+			: [Result] "=r" ((result).v)															\
+			: [Value] "r" ((value).v), [ShiftAmount] "n" (shift_amount)								\
 		)
+#else
+	/// @brief PSRAH : Parallel Shift Right Arithmetic Halfword
+	/// 
+	/// Arithmetically right shift 16-bit values. Shifts in sign bits into the upper bits.
+	/// @param result Variable identifier to store result to. Must be of type 'm128i16'
+	/// @param value Variable identifier to use as source value. Must be of type 'm128i16'
+	/// @param shift_amount Amount of bits to shift the source value right. Must be in range [0, 15]
+	#define PSRAH(result, value, shift_amount)														\
+		asm(																						\
+			"pcpyld	%[ResultLo],%[ValueHi],%[ValueLo]\n\t"											\
+			"psrah	%[ResultLo],%[ResultLo],%c[ShiftAmount]\n\t"									\
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"											\
+			: [ResultLo] "=r" ((result).lo),														\
+			  [ResultHi] "=&r" ((result).hi)														\
+			: [ValueLo] "r" ((value).lo),															\
+			  [ValueHi] "r" ((value).hi),															\
+			  [ShiftAmount] "n" (shift_amount)														\
+		)
+#endif
 
+	// PSRAW
+#ifdef PS2INTRIN_UNSAFE
 	/// @brief PSRAW : Parallel Shift Right Arithmetic Word
 	/// 
 	/// Arithmetically right shift 32-bit values. Shifts in sign bits into the upper bits.
 	/// @param result Variable identifier to store result to. Must be of type 'm128i32'
 	/// @param value Variable identifier to use as source value. Must be of type 'm128i32'
 	/// @param shift_amount Amount of bits to shift the source value left. Must be in range [0, 31]
-#define PSRAW(result, value, shift_amount)															\
+	#define PSRAW(result, value, shift_amount)														\
 		asm(																						\
-			"psraw %[Result],%[Value],%c[ShiftAmount]"												\
-			: [Result] "=r" (result)																\
-			: [Value] "r" (value), [ShiftAmount] "n" (shift_amount)									\
+			"psraw	%[Result],%[Value],%c[ShiftAmount]"												\
+			: [Result] "=r" ((result).v)															\
+			: [Value] "r" ((value).v),																\
+			  [ShiftAmount] "n" (shift_amount)														\
 		)
+#else
+	/// @brief PSRAW : Parallel Shift Right Arithmetic Word
+	/// 
+	/// Arithmetically right shift 32-bit values. Shifts in sign bits into the upper bits.
+	/// @param result Variable identifier to store result to. Must be of type 'm128i32'
+	/// @param value Variable identifier to use as source value. Must be of type 'm128i32'
+	/// @param shift_amount Amount of bits to shift the source value left. Must be in range [0, 31]
+	#define PSRAW(result, value, shift_amount)														\
+		asm(																						\
+			"pcpyld	%[ResultLo],%[ValueHi],%[ValueLo]\n\t"											\
+			"psraw	%[ResultLo],%[ResultLo],%c[ShiftAmount]\n\t"									\
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"											\
+			: [ResultLo] "=r" ((result).lo),														\
+			  [ResultHi] "=&r" ((result).hi)														\
+			: [ValueLo] "r" ((value).lo),															\
+			  [ValueHi] "r" ((value).hi),															\
+			  [ShiftAmount] "n" (shift_amount)														\
+		)
+#endif
 
 	/// @brief PSRAVW : Parallel Shift Right Arithmetic Variable Word
 	/// 
@@ -5078,42 +6473,102 @@ extern "C" {
 	/// @return Values shifted right by variable amount
 	FORCEINLINE CONST m128i64 mm_srav_epi64(m128i64 value, m128u64 shift_amount)
 	{
-		m128i64 result;
+		m128i64 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"psravw %[Result],%[Value],%[Amount]"
-			: [Result] "=r" (result)
-			: [Value] "r" (value), [Amount] "r" (shift_amount)
+			"psravw	%[Result],%[Value],%[Amount]"
+			: [Result] "=r" (result.v)
+			: [Value] "r" (value.v),
+			  [Amount] "r" (shift_amount.v)
 		);
+#else
+		asm(
+			"pcpyld	%[ValueLo],%[ValueHi],%[ValueLo]\n\t"
+			"pcpyld	%[AmountLo],%[AmountHi],%[AmountLo]\n\t"
+			"psravw	%[ResultLo],%[ValueLo],%[AmountLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [ValueLo] "r" (value.lo),
+			  [ValueHi] "r" (value.hi),
+			  [AmountLo] "r" (shift_amount.lo),
+			  [AmountHi] "r" (shift_amount.hi)
+		);
+#endif
 
 		return result;
 	}
 
+	// PSRLH
+#ifdef PS2INTRIN_UNSAFE
 	/// @brief PSRLH : Parallel Shift Right Logical Halfword
 	/// 
 	/// Logically right shift 16-bit values. Shifts in '0's into the upper bits.
 	/// @param result Variable identifier to store result to. Must be of type 'm128u16'
 	/// @param value Variable identifier to use as source value. Must be of type 'm128u16'
 	/// @param shift_amount Amount of bits to shift the source value right. Must be in range [0, 15]
-#define PSRLH(result, value, shift_amount)															\
+	#define PSRLH(result, value, shift_amount)														\
 		asm(																						\
-			"psrlh %[Result],%[Value],%c[ShiftAmount]"												\
-			: [Result] "=r" (result)																\
-			: [Value] "r" (value), [ShiftAmount] "n" (shift_amount)									\
+			"psrlh	%[Result],%[Value],%c[ShiftAmount]"												\
+			: [Result] "=r" ((result).v)															\
+			: [Value] "r" ((value).v),																\
+			  [ShiftAmount] "n" (shift_amount)														\
 		)
+#else
+	/// @brief PSRLH : Parallel Shift Right Logical Halfword
+	/// 
+	/// Logically right shift 16-bit values. Shifts in '0's into the upper bits.
+	/// @param result Variable identifier to store result to. Must be of type 'm128u16'
+	/// @param value Variable identifier to use as source value. Must be of type 'm128u16'
+	/// @param shift_amount Amount of bits to shift the source value right. Must be in range [0, 15]
+	#define PSRLH(result, value, shift_amount)														\
+		asm(																						\
+			"pcpyld	%[ResultLo],%[ValueHi],%[ValueLo]\n\t"											\
+			"psrlh	%[ResultLo],%[ResultLo],%c[ShiftAmount]\n\t"									\
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"											\
+			: [ResultLo] "=r" ((result).lo),														\
+			  [ResultHi] "=&r" ((result).hi)														\
+			: [ValueLo] "r" ((value).lo),															\
+			  [ValueHi] "r" ((value).hi),															\
+			  [ShiftAmount] "n" (shift_amount)														\
+		)
+#endif
 
+	// PSRLW
+#ifdef PS2INTRIN_UNSAFE
 	/// @brief PSRLW : Parallel Shift Right Logical Word
 	/// 
 	/// Logically right shift 32-bit values. Shifts in '0's into the upper bits.
 	/// @param result Variable identifier to store result to. Must be of type 'm128u32'
 	/// @param value Variable identifier to use as source value. Must be of type 'm128u32'
 	/// @param shift_amount Amount of bits to shift the source value left. Must be in range [0, 31]
-#define PSRLW(result, value, shift_amount)															\
+	#define PSRLW(result, value, shift_amount)														\
 		asm(																						\
-			"psrlw %[Result],%[Value],%c[ShiftAmount]"												\
-			: [Result] "=r" (result)																\
-			: [Value] "r" (value), [ShiftAmount] "n" (shift_amount)									\
+			"psrlw	%[Result],%[Value],%c[ShiftAmount]"												\
+			: [Result] "=r" ((result).v)															\
+			: [Value] "r" ((value).v),																\
+			  [ShiftAmount] "n" (shift_amount)														\
 		)
+#else
+	/// @brief PSRLW : Parallel Shift Right Logical Word
+	/// 
+	/// Logically right shift 32-bit values. Shifts in '0's into the upper bits.
+	/// @param result Variable identifier to store result to. Must be of type 'm128u32'
+	/// @param value Variable identifier to use as source value. Must be of type 'm128u32'
+	/// @param shift_amount Amount of bits to shift the source value left. Must be in range [0, 31]
+	#define PSRLW(result, value, shift_amount)														\
+		asm(																						\
+			"pcpyld	%[ResultLo],%[ValueHi],%[ValueLo]\n\t"											\
+			"psrlw	%[ResultLo],%[ResultLo],%c[ShiftAmount]\n\t"									\
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"											\
+			: [ResultLo] "=r" ((result).lo),														\
+			  [ResultHi] "=&r" ((result).hi)														\
+			: [ValueLo] "r" ((value).lo),															\
+			  [ValueHi] "r" ((value).hi),															\
+			  [ShiftAmount] "n" (shift_amount)														\
+		)
+#endif
 
 	/// @brief PSRAVW : Parallel Shift Right Logical Variable Word
 	/// 
@@ -5126,13 +6581,29 @@ extern "C" {
 	/// @return Values shifted right by variable amount
 	FORCEINLINE CONST m128u64 mm_srlv_epu64(m128u64 value, m128u64 shift_amount)
 	{
-		m128u64 result;
+		m128u64 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"psrlvw %[Result],%[Value],%[Amount]"
-			: [Result] "=r" (result)
-			: [Value] "r" (value), [Amount] "r" (shift_amount)
+			"psrlvw	%[Result],%[Value],%[Amount]"
+			: [Result] "=r" (result.v)
+			: [Value] "r" (value.v),
+			  [Amount] "r" (shift_amount.v)
 		);
+#else
+		asm(
+			"pcpyld	%[ValueLo],%[ValueHi],%[ValueLo]\n\t"
+			"pcpyld	%[AmountLo],%[AmountHi],%[AmountLo]\n\t"
+			"psrlvw	%[ResultLo],%[ValueLo],%[AmountLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [ValueLo] "r" (value.lo),
+			  [ValueHi] "r" (value.hi),
+			  [AmountLo] "r" (shift_amount.lo),
+			  [AmountHi] "r" (shift_amount.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5148,13 +6619,25 @@ extern "C" {
 	/// @return Absolute values of argument with truncation
 	FORCEINLINE CONST m128i16 mm_abs_epi16(m128i16 v)
 	{
-		m128i16 result;
+		m128i16 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pabsh %[Result],%[Value]"
-			: [Result] "=r" (result)
-			: [Value] "r" (v)
+			"pabsh	%[Result],%[Value]"
+			: [Result] "=r" (result.v)
+			: [Value] "r" (v.v)
 		);
+#else
+		asm(
+			"pcpyld	%[ValueLo],%[ValueHi],%[ValueLo]\n\t"
+			"pabsh	%[ResultLo],%[ValueLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [ValueLo] "r" (v.lo),
+			  [ValueHi] "r" (v.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5169,13 +6652,25 @@ extern "C" {
 	/// @return Absolute values of argument with truncation
 	FORCEINLINE CONST m128i32 mm_abs_epi32(m128i32 v)
 	{
-		m128i32 result;
+		m128i32 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pabsw %[Result],%[Value]"
-			: [Result] "=r" (result)
-			: [Value] "r" (v)
+			"pabsw	%[Result],%[Value]"
+			: [Result] "=r" (result.v)
+			: [Value] "r" (v.v)
 		);
+#else
+		asm(
+			"pcpyld	%[ValueLo],%[ValueHi],%[ValueLo]\n\t"
+			"pabsw	%[ResultLo],%[ValueLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=r" (result.hi)
+			: [ValueLo] "r" (v.lo),
+			  [ValueHi] "r" (v.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5191,13 +6686,29 @@ extern "C" {
 	/// @return Maximum value of each value pair
 	FORCEINLINE CONST m128i16 mm_max_epi16(m128i16 l, m128i16 r)
 	{
-		m128i16 result;
+		m128i16 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pmaxh %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"pmaxh	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"pmaxh	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5213,13 +6724,29 @@ extern "C" {
 	/// @return Maximum value of each value pair
 	FORCEINLINE CONST m128i32 mm_max_epi32(m128i32 l, m128i32 r)
 	{
-		m128i32 result;
+		m128i32 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pmaxw %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"pmaxw	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"pmaxw	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5235,13 +6762,29 @@ extern "C" {
 	/// @return Minimum value of each value pair
 	FORCEINLINE CONST m128i16 mm_min_epi16(m128i16 l, m128i16 r)
 	{
-		m128i16 result;
+		m128i16 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pminh %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"pminh	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"pminh	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5257,13 +6800,29 @@ extern "C" {
 	/// @return Minimum value of each value pair
 	FORCEINLINE CONST m128i32 mm_min_epi32(m128i32 l, m128i32 r)
 	{
-		m128i32 result;
+		m128i32 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pminw %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"pminw	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"pminw	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5277,13 +6836,29 @@ extern "C" {
 	/// @return Result of addition of both operands
 	FORCEINLINE CONST m128i8 mm_add_epi8(m128i8 l, m128i8 r)
 	{
-		m128i8 result;
+		m128i8 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"paddb %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"paddb	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"paddb	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5296,15 +6871,7 @@ extern "C" {
 	/// @return Result of addition of both operands
 	FORCEINLINE CONST m128u8 mm_add_epu8(m128u8 l, m128u8 r)
 	{
-		m128u8 result;
-
-		asm(
-			"paddb %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu8_epi8(mm_add_epi8(mm_castepi8_epu8(l), mm_castepi8_epu8(r)));
 	}
 	
 	/// @brief PADDH : Parallel ADD Halfword
@@ -5315,13 +6882,29 @@ extern "C" {
 	/// @return Result of addition of both operands
 	FORCEINLINE CONST m128i16 mm_add_epi16(m128i16 l, m128i16 r)
 	{
-		m128i16 result;
+		m128i16 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"paddh %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"paddh	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"paddh	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5334,15 +6917,7 @@ extern "C" {
 	/// @return Result of addition of both operands
 	FORCEINLINE CONST m128u16 mm_add_epu16(m128u16 l, m128u16 r)
 	{
-		m128u16 result;
-
-		asm(
-			"paddh %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu16_epi16(mm_add_epi16(mm_castepi16_epu16(l), mm_castepi16_epu16(r)));
 	}
 
 	/// @brief PADDW : Parallel ADD Word
@@ -5353,13 +6928,29 @@ extern "C" {
 	/// @return Result of addition of both operands
 	FORCEINLINE CONST m128i32 mm_add_epi32(m128i32 l, m128i32 r)
 	{
-		m128i32 result;
+		m128i32 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"paddw %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"paddw	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"paddw	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5372,15 +6963,7 @@ extern "C" {
 	/// @return Result of addition of both operands
 	FORCEINLINE CONST m128u32 mm_add_epu32(m128u32 l, m128u32 r)
 	{
-		m128u32 result;
-
-		asm(
-			"paddw %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu32_epi32(mm_add_epi32(mm_castepi32_epu32(l), mm_castepi32_epu32(r)));
 	}
 
 	/// @brief PADDSB : Parallel ADD Signed saturation Byte
@@ -5392,13 +6975,29 @@ extern "C" {
 	/// @return Result of signed saturated addition of both operands
 	FORCEINLINE CONST m128i8 mm_adds_epi8(m128i8 l, m128i8 r)
 	{
-		m128i8 result;
+		m128i8 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"paddsb %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"paddsb	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"paddsb	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5412,13 +7011,29 @@ extern "C" {
 	/// @return Result of unsigned saturated addition of both operands
 	FORCEINLINE CONST m128u8 mm_adds_epu8(m128u8 l, m128u8 r)
 	{
-		m128u8 result;
+		m128u8 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"paddub %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"paddub	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"paddub	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5432,13 +7047,29 @@ extern "C" {
 	/// @return Result of signed saturated addition of both operands
 	FORCEINLINE CONST m128i16 mm_adds_epi16(m128i16 l, m128i16 r)
 	{
-		m128i16 result;
+		m128i16 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"paddsh %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"paddsh	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"paddsh	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5452,13 +7083,29 @@ extern "C" {
 	/// @return Result of unsigned saturated addition of both operands
 	FORCEINLINE CONST m128u16 mm_adds_epu16(m128u16 l, m128u16 r)
 	{
-		m128u16 result;
+		m128u16 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"padduh %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"padduh	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"padduh	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5472,13 +7119,29 @@ extern "C" {
 	/// @return Result of signed saturated addition of both operands
 	FORCEINLINE CONST m128i32 mm_adds_epi32(m128i32 l, m128i32 r)
 	{
-		m128i32 result;
+		m128i32 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"paddsw %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"paddsw	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"paddsw	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5492,13 +7155,29 @@ extern "C" {
 	/// @return Result of unsigned saturated addition of both operands
 	FORCEINLINE CONST m128u32 mm_adds_epu32(m128u32 l, m128u32 r)
 	{
-		m128u32 result;
+		m128u32 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"padduw %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"padduw	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"padduw	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5513,13 +7192,29 @@ extern "C" {
 	/// @return Result of addition/subtraction of operands
 	FORCEINLINE CONST m128i16 mm_addsub_epi16(m128i16 l, m128i16 r)
 	{
-		m128i16 result;
+		m128i16 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"padsbh %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "r" (l), [Right] "r" (r)
+			"padsbh	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"padsbh	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5533,13 +7228,29 @@ extern "C" {
 	/// @return Result of subtraction of both operands
 	FORCEINLINE CONST m128i8 mm_sub_epi8(m128i8 l, m128i8 r)
 	{
-		m128i8 result;
+		m128i8 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"psubb %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "r" (l), [Right] "r" (r)
+			"psubb	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"psubb	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5552,15 +7263,7 @@ extern "C" {
 	/// @return Result of subtraction of both operands
 	FORCEINLINE CONST m128u8 mm_sub_epu8(m128u8 l, m128u8 r)
 	{
-		m128u8 result;
-
-		asm(
-			"psubb %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu8_epi8(mm_sub_epi8(mm_castepi8_epu8(l), mm_castepi8_epu8(r)));
 	}
 
 	/// @brief PSUBH : Parallel SUBtract Halfword
@@ -5571,13 +7274,29 @@ extern "C" {
 	/// @return Result of subtraction of both operands
 	FORCEINLINE CONST m128i16 mm_sub_epi16(m128i16 l, m128i16 r)
 	{
-		m128i16 result;
+		m128i16 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"psubh %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "r" (l), [Right] "r" (r)
+			"psubh	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"psubh	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5590,15 +7309,7 @@ extern "C" {
 	/// @return Result of subtraction of both operands
 	FORCEINLINE CONST m128u16 mm_sub_epu16(m128u16 l, m128u16 r)
 	{
-		m128u16 result;
-
-		asm(
-			"psubh %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu16_epi16(mm_sub_epi16(mm_castepi16_epu16(l), mm_castepi16_epu16(r)));
 	}
 
 	/// @brief PSUBW : Parallel SUBtract Word
@@ -5609,13 +7320,29 @@ extern "C" {
 	/// @return Result of subtraction of both operands
 	FORCEINLINE CONST m128i32 mm_sub_epi32(m128i32 l, m128i32 r)
 	{
-		m128i32 result;
+		m128i32 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"psubw %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "r" (l), [Right] "r" (r)
+			"psubw	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"psubw	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5628,15 +7355,7 @@ extern "C" {
 	/// @return Result of subtraction of both operands
 	FORCEINLINE CONST m128u32 mm_sub_epu32(m128u32 l, m128u32 r)
 	{
-		m128u32 result;
-
-		asm(
-			"psubw %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "r" (l), [Right] "r" (r)
-		);
-
-		return result;
+		return mm_castepu32_epi32(mm_sub_epi32(mm_castepi32_epu32(l), mm_castepi32_epu32(r)));
 	}
 
 	/// @brief PSUBSB : Parallel SUBtract Signed saturation Byte
@@ -5648,13 +7367,29 @@ extern "C" {
 	/// @return Result of signed saturated subtraction of both operands
 	FORCEINLINE CONST m128i8 mm_subs_epi8(m128i8 l, m128i8 r)
 	{
-		m128i8 result;
+		m128i8 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"psubsb %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "r" (l), [Right] "r" (r)
+			"psubsb	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"psubsb	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5668,13 +7403,29 @@ extern "C" {
 	/// @return Result of unsigned saturated subtraction of both operands
 	FORCEINLINE CONST m128u8 mm_subs_epu8(m128u8 l, m128u8 r)
 	{
-		m128u8 result;
+		m128u8 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"psubub %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "r" (l), [Right] "r" (r)
+			"psubub	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"psubub	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5688,13 +7439,29 @@ extern "C" {
 	/// @return Result of signed saturated subtraction of both operands
 	FORCEINLINE CONST m128i16 mm_subs_epi16(m128i16 l, m128i16 r)
 	{
-		m128i16 result;
+		m128i16 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"psubsh %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "r" (l), [Right] "r" (r)
+			"psubsh	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"psubsh	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5708,13 +7475,29 @@ extern "C" {
 	/// @return Result of unsigned saturated addition of both operands
 	FORCEINLINE CONST m128u16 mm_subs_epu16(m128u16 l, m128u16 r)
 	{
-		m128u16 result;
+		m128u16 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"psubuh %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "r" (l), [Right] "r" (r)
+			"psubuh	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"psubuh	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5728,13 +7511,29 @@ extern "C" {
 	/// @return Result of signed saturated subtraction of both operands
 	FORCEINLINE CONST m128i32 mm_subs_epi32(m128i32 l, m128i32 r)
 	{
-		m128i32 result;
+		m128i32 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"psubsw %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "r" (l), [Right] "r" (r)
+			"psubsw	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"psubsw	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5748,13 +7547,29 @@ extern "C" {
 	/// @return Result of unsigned saturated subtraction of both operands
 	FORCEINLINE CONST m128u32 mm_subs_epu32(m128u32 l, m128u32 r)
 	{
-		m128u32 result;
+		m128u32 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"psubuw %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "r" (l), [Right] "r" (r)
+			"psubuw	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "r" (l.v),
+			  [Right] "r" (r.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"psubuw	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5787,19 +7602,56 @@ extern "C" {
 	/// You can extract only the products not in the return value using 'mm_loadlohi_upper_epi32'.
 	/// 
 	/// This function writes to global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param l First operand
 	/// @param r Second operand
 	/// @return Multiplication result of value pairs in even positions
-	FORCEINLINE m128i32 mm_mul_epi16(m128i16 l, m128i16 r)
+	FORCEINLINE m128i32 mm_mul_epi16(lohi_state_t* state, m128i16 l, m128i16 r)
 	{
-		m128i32 result;
+		m128i32 result = {};
+
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
 
 		// volatile because writes to LO/HI
 		asm volatile(
-			"pmulth %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"pmulth	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
+			: "lo", "hi"
 		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
+
+		asm(
+			"pmflo	%[TmpLo]\n\t"
+			"pmfhi	%[TmpHi]\n\t"
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"pmulth	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]\n\t"
+			"pmflo	%[StateLo0]\n\t"
+			"pmfhi	%[StateHi0]\n\t"
+			"pcpyud	%[StateLo1],%[StateLo0],%[StateLo0]\n\t"
+			"pcpyud	%[StateHi1],%[StateHi0],%[StateHi0]\n\t"
+			"pmtlo	%[TmpLo]\n\t"
+			"pmthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi),
+			  [StateLo0] "=r" (state->lo[0]),
+			  [StateLo1] "=r" (state->lo[1]),
+			  [StateHi0] "=r" (state->hi[0]),
+			  [StateHi1] "=r" (state->hi[1])
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5815,19 +7667,56 @@ extern "C" {
 	/// register will stall the EE Core until the result is ready.
 	/// 
 	/// This function writes to global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param l First operand
 	/// @param r Second operand
 	/// @return Multiplication result containing full 64-bit signed values
-	FORCEINLINE m128i64 mm_mul_epi64(m128i64 l, m128i64 r)
+	FORCEINLINE m128i64 mm_mul_epi64(lohi_state_t* state, m128i64 l, m128i64 r)
 	{
-		m128i64 result;
+		m128i64 result = {};
+
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
 
 		// volatile because writes to LO/HI
 		asm volatile(
-			"pmultw %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"pmultw	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
+			: "lo", "hi"
 		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
+
+		asm(
+			"pmflo	%[TmpLo]\n\t"
+			"pmfhi	%[TmpHi]\n\t"
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"pmultw	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]\n\t"
+			"pmflo	%[StateLo0]\n\t"
+			"pmfhi	%[StateHi0]\n\t"
+			"pcpyud	%[StateLo1],%[StateLo0],%[StateLo0]\n\t"
+			"pcpyud	%[StateHi1],%[StateHi0],%[StateHi0]\n\t"
+			"pmtlo	%[TmpLo]\n\t"
+			"pmthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi),
+			  [StateLo0] "=r" (state->lo[0]),
+			  [StateLo1] "=r" (state->lo[1]),
+			  [StateHi0] "=r" (state->hi[0]),
+			  [StateHi1] "=r" (state->hi[1])
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5843,19 +7732,56 @@ extern "C" {
 	/// register will stall the EE Core until the result is ready.
 	/// 
 	/// This function writes to global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param l First operand
 	/// @param r Second operand
 	/// @return Multiplication result containing full 64-bit unsigned values
-	FORCEINLINE m128u64 mm_mul_epu64(m128u64 l, m128u64 r)
+	FORCEINLINE m128u64 mm_mul_epu64(lohi_state_t* state, m128u64 l, m128u64 r)
 	{
-		m128u64 result;
+		m128u64 result = {};
+
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
 
 		// volatile because writes to LO/HI
 		asm volatile(
-			"pmultuw %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"pmultuw	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
+			: "lo", "hi"
 		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
+
+		asm(
+			"pmflo	%[TmpLo]\n\t"
+			"pmfhi	%[TmpHi]\n\t"
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"pmultuw	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]\n\t"
+			"pmflo	%[StateLo0]\n\t"
+			"pmfhi	%[StateHi0]\n\t"
+			"pcpyud	%[StateLo1],%[StateLo0],%[StateLo0]\n\t"
+			"pcpyud	%[StateHi1],%[StateHi0],%[StateHi0]\n\t"
+			"pmtlo	%[TmpLo]\n\t"
+			"pmthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi),
+			  [StateLo0] "=r" (state->lo[0]),
+			  [StateLo1] "=r" (state->lo[1]),
+			  [StateHi0] "=r" (state->hi[0]),
+			  [StateHi1] "=r" (state->hi[1])
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5890,19 +7816,60 @@ extern "C" {
 	/// 'mm_loadlohi_upper_epi32'.
 	/// 
 	/// This function writes to global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param l First operand
 	/// @param r Second operand
 	/// @return Multipy-accumulate result of value pairs in even positions
-	FORCEINLINE m128i32 mm_fma_epi16(m128i16 l, m128i16 r)
+	FORCEINLINE m128i32 mm_fma_epi16(lohi_state_t* state, m128i16 l, m128i16 r)
 	{
-		m128i32 result;
+		m128i32 result = {};
+
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
 
 		// volatile because writes to LO/HI
 		asm volatile(
-			"pmaddh %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"pmaddh	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
+			: "lo", "hi"
 		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
+
+		asm(
+			"pmflo	%[TmpLo]\n\t"
+			"pmfhi	%[TmpHi]\n\t"
+			"pcpyld	%[StateLo0],%[StateLo1],%[StateLo0]\n\t"
+			"pcpyld	%[StateHi0],%[StateHi1],%[StateHi0]\n\t"
+			"pmtlo	%[StateLo0]\n\t"
+			"pmthi	%[StateHi0]\n\t"
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"pmaddh	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]\n\t"
+			"pmflo	%[StateLo0]\n\t"
+			"pmfhi	%[StateHi0]\n\t"
+			"pcpyud	%[StateLo1],%[StateLo0],%[StateLo0]\n\t"
+			"pcpyud	%[StateHi1],%[StateHi0],%[StateHi0]\n\t"
+			"pmtlo	%[TmpLo]\n\t"
+			"pmthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=r" (result.hi),
+			  [StateLo0] "+r" (state->lo[0]),
+			  [StateLo1] "+r" (state->lo[1]),
+			  [StateHi0] "+r" (state->hi[0]),
+			  [StateHi1] "+r" (state->hi[1])
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5920,19 +7887,60 @@ extern "C" {
 	/// register will stall the EE Core until the result is ready.
 	/// 
 	/// This function writes to global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param l First operand
 	/// @param r Second operand
 	/// @return Multiply-accumulate result containing full 64-bit signed values
-	FORCEINLINE m128i64 mm_fma_epi64(m128i64 l, m128i64 r)
+	FORCEINLINE m128i64 mm_fma_epi64(lohi_state_t* state, m128i64 l, m128i64 r)
 	{
-		m128i64 result;
+		m128i64 result = {};
+
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
 
 		// volatile because writes to LO/HI
 		asm volatile(
-			"pmaddw %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-			);
+			"pmaddw	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
+			: "lo", "hi"
+		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
+
+		asm(
+			"pmflo	%[TmpLo]\n\t"
+			"pmfhi	%[TmpHi]\n\t"
+			"pcpyld	%[StateLo0],%[StateLo1],%[StateLo0]\n\t"
+			"pcpyld	%[StateHi0],%[StateHi1],%[StateHi0]\n\t"
+			"pmtlo	%[StateLo0]\n\t"
+			"pmthi	%[StateHi0]\n\t"
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"pmaddw	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]\n\t"
+			"pmflo	%[StateLo0]\n\t"
+			"pmfhi	%[StateHi0]\n\t"
+			"pcpyud	%[StateLo1],%[StateLo0],%[StateLo0]\n\t"
+			"pcpyud	%[StateHi1],%[StateHi0],%[StateHi0]\n\t"
+			"pmtlo	%[TmpLo]\n\t"
+			"pmthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=r" (result.hi),
+			  [StateLo0] "+r" (state->lo[0]),
+			  [StateLo1] "+r" (state->lo[1]),
+			  [StateHi0] "+r" (state->hi[0]),
+			  [StateHi1] "+r" (state->hi[1])
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5950,19 +7958,60 @@ extern "C" {
 	/// register will stall the EE Core until the result is ready.
 	/// 
 	/// This function writes to global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param l First operand
 	/// @param r Second operand
 	/// @return Multiply-accumulate result containing full 64-bit unsigned values
-	FORCEINLINE m128u64 mm_fma_epu64(m128u64 l, m128u64 r)
+	FORCEINLINE m128u64 mm_fma_epu64(lohi_state_t* state, m128u64 l, m128u64 r)
 	{
-		m128u64 result;
+		m128u64 result = {};
+
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
 
 		// volatile because writes to LO/HI
 		asm volatile(
-			"pmadduw %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-			);
+			"pmadduw	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
+			: "lo", "hi"
+		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
+
+		asm(
+			"pmflo	%[TmpLo]\n\t"
+			"pmfhi	%[TmpHi]\n\t"
+			"pcpyld	%[StateLo0],%[StateLo1],%[StateLo0]\n\t"
+			"pcpyld	%[StateHi0],%[StateHi1],%[StateHi0]\n\t"
+			"pmtlo	%[StateLo0]\n\t"
+			"pmthi	%[StateHi0]\n\t"
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"pmadduw	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]\n\t"
+			"pmflo	%[StateLo0]\n\t"
+			"pmfhi	%[StateHi0]\n\t"
+			"pcpyud	%[StateLo1],%[StateLo0],%[StateLo0]\n\t"
+			"pcpyud	%[StateHi1],%[StateHi0],%[StateHi0]\n\t"
+			"pmtlo	%[TmpLo]\n\t"
+			"pmthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=r" (result.hi),
+			  [StateLo0] "+r" (state->lo[0]),
+			  [StateLo1] "+r" (state->lo[1]),
+			  [StateHi0] "+r" (state->hi[0]),
+			  [StateHi1] "+r" (state->hi[1])
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -5978,19 +8027,60 @@ extern "C" {
 	/// 'mm_loadlohi_upper_epi32'.
 	/// 
 	/// This function writes to global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param l First operand
 	/// @param r Second operand
 	/// @return Multipy-accumulate result of value pairs in even positions
-	FORCEINLINE m128i32 mm_fms_epi16(m128i16 l, m128i16 r)
+	FORCEINLINE m128i32 mm_fms_epi16(lohi_state_t* state, m128i16 l, m128i16 r)
 	{
-		m128i32 result;
+		m128i32 result = {};
+
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
 
 		// volatile because writes to LO/HI
 		asm volatile(
-			"pmsubh %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"pmsubh	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
+			: "lo", "hi"
 		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
+
+		asm(
+			"pmflo	%[TmpLo]\n\t"
+			"pmfhi	%[TmpHi]\n\t"
+			"pcpyld	%[StateLo0],%[StateLo1],%[StateLo0]\n\t"
+			"pcpyld	%[StateHi0],%[StateHi1],%[StateHi0]\n\t"
+			"pmtlo	%[StateLo0]\n\t"
+			"pmthi	%[StateHi0]\n\t"
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"pmsubh	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]\n\t"
+			"pmflo	%[StateLo0]\n\t"
+			"pmfhi	%[StateHi0]\n\t"
+			"pcpyud	%[StateLo1],%[StateLo0],%[StateLo0]\n\t"
+			"pcpyud	%[StateHi1],%[StateHi0],%[StateHi0]\n\t"
+			"pmtlo	%[TmpLo]\n\t"
+			"pmthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=r" (result.hi),
+			  [StateLo0] "+r" (state->lo[0]),
+			  [StateLo1] "+r" (state->lo[1]),
+			  [StateHi0] "+r" (state->hi[0]),
+			  [StateHi1] "+r" (state->hi[1])
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -6003,19 +8093,60 @@ extern "C" {
 	/// register will stall the EE Core until the result is ready.
 	/// 
 	/// This function writes to global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param l First operand
 	/// @param r Second operand
 	/// @return Multiply-accumulate result containing full 64-bit signed values
-	FORCEINLINE m128i64 mm_fms_epi64(m128i64 l, m128i64 r)
+	FORCEINLINE m128i64 mm_fms_epi64(lohi_state_t* state, m128i64 l, m128i64 r)
 	{
-		m128i64 result;
+		m128i64 result = {};
+
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
 
 		// volatile because writes to LO/HI
 		asm volatile(
-			"pmsubw %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"pmsubw	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
+			: "lo", "hi"
 		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
+
+		asm(
+			"pmflo	%[TmpLo]\n\t"
+			"pmfhi	%[TmpHi]\n\t"
+			"pcpyld	%[StateLo0],%[StateLo1],%[StateLo0]\n\t"
+			"pcpyld	%[StateHi0],%[StateHi1],%[StateHi0]\n\t"
+			"pmtlo	%[StateLo0]\n\t"
+			"pmthi	%[StateHi0]\n\t"
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"pmsubw	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]\n\t"
+			"pmflo	%[StateLo0]\n\t"
+			"pmfhi	%[StateHi0]\n\t"
+			"pcpyud	%[StateLo1],%[StateLo0],%[StateLo0]\n\t"
+			"pcpyud	%[StateHi1],%[StateHi0],%[StateHi0]\n\t"
+			"pmtlo	%[TmpLo]\n\t"
+			"pmthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=r" (result.hi),
+			  [StateLo0] "+r" (state->lo[0]),
+			  [StateLo1] "+r" (state->lo[1]),
+			  [StateHi0] "+r" (state->hi[0]),
+			  [StateHi1] "+r" (state->hi[1])
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -6052,18 +8183,60 @@ extern "C" {
 	/// register will stall the EE Core until the result is ready.
 	/// 
 	/// This function writes to global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param l First Operand
 	/// @param r Second Operand
 	/// @return Horizontal sums of multiplication products
-	FORCEINLINE m128i32 mm_hmuladd_epi16(m128i16 l, m128i16 r)
+	FORCEINLINE m128i32 mm_hmuladd_epi16(lohi_state_t* state, m128i16 l, m128i16 r)
 	{
-		m128i32 result;
+		m128i32 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
+		// volatile because writes to LO/HI
 		asm volatile(
-			"phmadh %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
+			"phmadh	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
+			: "lo", "hi"
 		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
+
+		asm(
+			"pmflo	%[TmpLo]\n\t"
+			"pmfhi	%[TmpHi]\n\t"
+			"pcpyld	%[StateLo0],%[StateLo1],%[StateLo0]\n\t"
+			"pcpyld	%[StateHi0],%[StateHi1],%[StateHi0]\n\t"
+			"pmtlo	%[StateLo0]\n\t"
+			"pmthi	%[StateHi0]\n\t"
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"phmadh	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]\n\t"
+			"pmflo	%[StateLo0]\n\t"
+			"pmfhi	%[StateHi0]\n\t"
+			"pcpyud	%[StateLo1],%[StateLo0],%[StateLo0]\n\t"
+			"pcpyud	%[StateHi1],%[StateHi0],%[StateHi0]\n\t"
+			"pmtlo	%[TmpLo]\n\t"
+			"pmthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=r" (result.hi),
+			  [StateLo0] "+r" (state->lo[0]),
+			  [StateLo1] "+r" (state->lo[1]),
+			  [StateHi0] "+r" (state->hi[0]),
+			  [StateHi1] "+r" (state->hi[1])
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -6100,18 +8273,60 @@ extern "C" {
 	/// register will stall the EE Core until the result is ready.
 	/// 
 	/// This function writes to global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param l First Operand
 	/// @param r Second Operand
 	/// @return Horizontal differences of multiplication products
-	FORCEINLINE m128i32 mm_hmulsub_epi16(m128i16 l, m128i16 r)
+	FORCEINLINE m128i32 mm_hmulsub_epi16(lohi_state_t* state, m128i16 l, m128i16 r)
 	{
-		m128i32 result;
+		m128i32 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
+		// volatile because writes to LO/HI
 		asm volatile(
-			"phmsbh %[Result],%[Left],%[Right]"
-			: [Result] "=r" (result)
-			: [Left] "%r" (l), [Right] "r" (r)
-			);
+			"phmsbh	%[Result],%[Left],%[Right]"
+			: [Result] "=r" (result.v)
+			: [Left] "%r" (l.v),
+			  [Right] "r" (r.v)
+			: "lo", "hi"
+		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
+
+		asm(
+			"pmflo	%[TmpLo]\n\t"
+			"pmfhi	%[TmpHi]\n\t"
+			"pcpyld	%[StateLo0],%[StateLo1],%[StateLo0]\n\t"
+			"pcpyld	%[StateHi0],%[StateHi1],%[StateHi0]\n\t"
+			"pmtlo	%[StateLo0]\n\t"
+			"pmthi	%[StateHi0]\n\t"
+			"pcpyld	%[LeftLo],%[LeftHi],%[LeftLo]\n\t"
+			"pcpyld	%[RightLo],%[RightHi],%[RightLo]\n\t"
+			"phmsbh	%[ResultLo],%[LeftLo],%[RightLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]\n\t"
+			"pmflo	%[StateLo0]\n\t"
+			"pmfhi	%[StateHi0]\n\t"
+			"pcpyud	%[StateLo1],%[StateLo0],%[StateLo0]\n\t"
+			"pcpyud	%[StateHi1],%[StateHi0],%[StateHi0]\n\t"
+			"pmtlo	%[TmpLo]\n\t"
+			"pmthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=r" (result.hi),
+			  [StateLo0] "+r" (state->lo[0]),
+			  [StateLo1] "+r" (state->lo[1]),
+			  [StateHi0] "+r" (state->hi[0]),
+			  [StateHi1] "+r" (state->hi[1])
+			: [LeftLo] "r" (l.lo),
+			  [LeftHi] "r" (l.hi),
+			  [RightLo] "r" (r.lo),
+			  [RightHi] "r" (r.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -6130,16 +8345,50 @@ extern "C" {
 	/// that point in time.
 	/// 
 	/// This function writes to global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param dividend Values to divide
 	/// @param divisor Values to divide by
-	FORCEINLINE void mm_divrem_epi64(m128i64 dividend, m128i64 divisor)
+	FORCEINLINE void mm_divrem_epi64(lohi_state_t* state, m128i64 dividend, m128i64 divisor)
 	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
 		// volatile because writes to LO/HI
 		asm volatile(
-			"pdivw %[Dividend],%[Divisor]"
+			"pdivw	%[Dividend],%[Divisor]"
 			:
-			: [Dividend] "r" (dividend), [Divisor] "r" (divisor)
+			: [Dividend] "r" (dividend.v),
+			  [Divisor] "r" (divisor.v)
+			: "lo", "hi"
 		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
+		
+		asm(
+			"pmflo	%[TmpLo]\n\t"
+			"pmfhi	%[TmpHi]\n\t"
+			"pcpyld	%[DividendLo],%[DividendHi],%[DividendLo]\n\t"
+			"pcpyld	%[DivisorLo],%[DivisorHi],%[DivisorLo]\n\t"
+			"pdivw	%[DividendLo],%[DivisorLo]\n\t"
+			"pmflo	%[StateLo0]\n\t"
+			"pmfhi	%[StateHi0]\n\t"
+			"pcpyud	%[StateLo1],%[StateLo0],%[StateLo0]\n\t"
+			"pcpyud	%[StateHi1],%[StateHi0],%[StateHi0]\n\t"
+			"pmtlo	%[TmpLo]\n\t"
+			"pmthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [StateLo0] "=r" (state->lo[0]),
+			  [StateLo1] "=r" (state->lo[1]),
+			  [StateHi0] "=r" (state->hi[0]),
+			  [StateHi1] "=r" (state->hi[1])
+			: [DividendLo] "r" (dividend.lo),
+			  [DividendHi] "r" (dividend.hi),
+			  [DivisorLo] "r" (divisor.lo),
+			  [DivisorHi] "r" (divisor.hi)
+		);
+#endif
 	}
 
 	/// @brief PDIVUW : Parallel DIVide Unsigned Word
@@ -6155,16 +8404,50 @@ extern "C" {
 	/// that point in time.
 	/// 
 	/// This function writes to global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param dividend Values to divide
 	/// @param divisor Values to divide by
-	FORCEINLINE void mm_divrem_epu64(m128u64 dividend, m128u64 divisor)
+	FORCEINLINE void mm_divrem_epu64(lohi_state_t* state, m128u64 dividend, m128u64 divisor)
 	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
 		// volatile because writes to LO/HI
 		asm volatile(
-			"pdivuw %[Dividend],%[Divisor]"
+			"pdivuw	%[Dividend],%[Divisor]"
 			:
-			: [Dividend] "r" (dividend), [Divisor] "r" (divisor)
+			: [Dividend] "r" (dividend.v),
+			  [Divisor] "r" (divisor.v)
+			: "lo", "hi"
 		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
+
+		asm(
+			"pmflo	%[TmpLo]\n\t"
+			"pmfhi	%[TmpHi]\n\t"
+			"pcpyld	%[DividendLo],%[DividendHi],%[DividendLo]\n\t"
+			"pcpyld	%[DivisorLo],%[DivisorHi],%[DivisorLo]\n\t"
+			"pdivuw	%[DividendLo],%[DivisorLo]\n\t"
+			"pmflo	%[StateLo0]\n\t"
+			"pmfhi	%[StateHi0]\n\t"
+			"pcpyud	%[StateLo1],%[StateLo0],%[StateLo0]\n\t"
+			"pcpyud	%[StateHi1],%[StateHi0],%[StateHi0]\n\t"
+			"pmtlo	%[TmpLo]\n\t"
+			"pmthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [StateLo0] "=r" (state->lo[0]),
+			  [StateLo1] "=r" (state->lo[1]),
+			  [StateHi0] "=r" (state->hi[0]),
+			  [StateHi1] "=r" (state->hi[1])
+			: [DividendLo] "r" (dividend.lo),
+			  [DividendHi] "r" (dividend.hi),
+			  [DivisorLo] "r" (divisor.lo),
+			  [DivisorHi] "r" (divisor.hi)
+		);
+#endif
 	}
 
 	/// @brief PDIVBW : Parallel DIVide Broadcast Word
@@ -6178,16 +8461,48 @@ extern "C" {
 	/// that point in time.
 	/// 
 	/// This function writes to global state (LO/HI).
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param dividend Values to divide
 	/// @param divisor Value to divide by
-	FORCEINLINE void mm_divremb_epi32(m128i32 dividend, int16_t divisor)
+	FORCEINLINE void mm_divremb_epi32(lohi_state_t* state, m128i32 dividend, int16_t divisor)
 	{
+#ifdef PS2INTRIN_UNSAFE
+		(void)state;
+
 		// volatile because writes to LO/HI
 		asm volatile(
-			"pdivbw %[Dividend],%[Divisor]"
+			"pdivbw	%[Dividend],%[Divisor]"
 			:
-			: [Dividend] "r" (dividend), [Divisor] "r" (divisor)
+			: [Dividend] "r" (dividend.v),
+			  [Divisor] "r" (divisor)
+			: "lo", "hi"
 		);
+#else
+		uint64_t tmplo = 0;
+		uint64_t tmphi = 0;
+
+		asm(
+			"pmflo	%[TmpLo]\n\t"
+			"pmfhi	%[TmpHi]\n\t"
+			"pcpyld	%[DividendLo],%[DividendHi],%[DividendLo]\n\t"
+			"pdivbw	%[DividendLo],%[Divisor]\n\t"
+			"pmflo	%[StateLo0]\n\t"
+			"pmfhi	%[StateHi0]\n\t"
+			"pcpyud	%[StateLo1],%[StateLo0],%[StateLo0]\n\t"
+			"pcpyud	%[StateHi1],%[StateHi0],%[StateHi0]\n\t"
+			"pmtlo	%[TmpLo]\n\t"
+			"pmthi	%[TmpHi]"
+			: [TmpLo] "=&r" (tmplo),
+			  [TmpHi] "=&r" (tmphi),
+			  [StateLo0] "=r" (state->lo[0]),
+			  [StateLo1] "=r" (state->lo[1]),
+			  [StateHi0] "=r" (state->hi[0]),
+			  [StateHi1] "=r" (state->hi[1])
+			: [DividendLo] "r" (dividend.lo),
+			  [DividendHi] "r" (dividend.hi),
+			  [Divisor] "r" (divisor)
+		);
+#endif
 	}
 
 
@@ -6200,13 +8515,25 @@ extern "C" {
 	/// @return Broadcasted values
 	FORCEINLINE CONST m128i16 mm_broadcast2_epi16(m128i16 v)
 	{
-		m128i16 result;
+		m128i16 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pcpyh %[Result],%[Value]"
-			: [Result] "=r" (result)
-			: [Value] "r" (v)
+			"pcpyh	%[Result],%[Value]"
+			: [Result] "=r" (result.v)
+			: [Value] "r" (v.v)
 		);
+#else
+		asm(
+			"pcpyld	%[ValueLo],%[ValueHi],%[ValueLo]\n\t"
+			"pcpyh	%[ResultLo],%[ValueLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [ValueLo] "r" (v.lo),
+			  [ValueHi] "r" (v.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -6220,15 +8547,7 @@ extern "C" {
 	/// @return Broadcasted values
 	FORCEINLINE CONST m128u16 mm_broadcast2_epu16(m128u16 v)
 	{
-		m128u16 result;
-
-		asm(
-			"pcpyh %[Result],%[Value]"
-			: [Result] "=r" (result)
-			: [Value] "r" (v)
-		);
-
-		return result;
+		return mm_castepu16_epi16(mm_broadcast2_epi16(mm_castepi16_epu16(v)));
 	}
 
 	/// @brief PCPYLD : Parallel CoPY Lower Doubleword
@@ -6239,13 +8558,19 @@ extern "C" {
 	/// @return Combined values
 	FORCEINLINE CONST m128i64 mm_unpacklo_epi64(m128i64 lower, m128i64 upper)
 	{
-		m128i64 result;
+		m128i64 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pcpyld %[Result],%[Upper],%[Lower]"
-			: [Result] "=r" (result)
-			: [Upper] "r" (upper), [Lower] "r" (lower)
+			"pcpyld	%[Result],%[Upper],%[Lower]"
+			: [Result] "=r" (result.v)
+			: [Upper] "r" (upper.v),
+			  [Lower] "r" (lower.v)
 		);
+#else
+		result.lo = lower.lo;
+		result.hi = upper.lo;
+#endif
 
 		return result;
 	}
@@ -6258,15 +8583,7 @@ extern "C" {
 	/// @return Combined values
 	FORCEINLINE CONST m128u64 mm_unpacklo_epu64(m128u64 lower, m128u64 upper)
 	{
-		m128u64 result;
-
-		asm(
-			"pcpyld %[Result],%[Upper],%[Lower]"
-			: [Result] "=r" (result)
-			: [Upper] "r" (upper), [Lower] "r" (lower)
-		);
-
-		return result;
+		return mm_castepu64_epi64(mm_unpacklo_epi64(mm_castepi64_epu64(lower), mm_castepi64_epu64(upper)));
 	}
 
 	/// @brief PCPYUD : Parallel CoPY Upper Doubleword
@@ -6277,13 +8594,19 @@ extern "C" {
 	/// @return Combined values
 	FORCEINLINE CONST m128i64 mm_unpackhi_epi64(m128i64 lower, m128i64 upper)
 	{
-		m128i64 result;
+		m128i64 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pcpyud %[Result],%[Lower],%[Upper]"
-			: [Result] "=r" (result)
-			: [Upper] "r" (upper), [Lower] "r" (lower)
+			"pcpyud	%[Result],%[Lower],%[Upper]"
+			: [Result] "=r" (result.v)
+			: [Upper] "r" (upper.v),
+			  [Lower] "r" (lower.v)
 		);
+#else
+		result.lo = lower.hi;
+		result.hi = upper.hi;
+#endif
 
 		return result;
 	}
@@ -6296,15 +8619,7 @@ extern "C" {
 	/// @return Combined values
 	FORCEINLINE CONST m128u64 mm_unpackhi_epu64(m128u64 lower, m128u64 upper)
 	{
-		m128u64 result;
-
-		asm(
-			"pcpyud %[Result],%[Lower],%[Upper]"
-			: [Result] "=r" (result)
-			: [Upper] "r" (upper), [Lower] "r" (lower)
-		);
-
-		return result;
+		return mm_castepu64_epi64(mm_unpackhi_epi64(mm_castepi64_epu64(lower), mm_castepi64_epu64(upper)));
 	}
 
 	/// @brief PEXCH : Parallel EXchange Center Halfword
@@ -6316,13 +8631,25 @@ extern "C" {
 	/// @return Values after exchanging center values
 	FORCEINLINE CONST m128i16 mm_xchgcenter_epi16(m128i16 v)
 	{
-		m128i16 result;
+		m128i16 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pexch %[Result],%[Value]"
-			: [Result] "=r" (result)
-			: [Value] "r" (v)
+			"pexch	%[Result],%[Value]"
+			: [Result] "=r" (result.v)
+			: [Value] "r" (v.v)
 		);
+#else
+		asm(
+			"pcpyld	%[ValueLo],%[ValueHi],%[ValueHi]\n\t"
+			"pexch	%[ResultLo],%[ValueLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [ValueLo] "r" (v.lo),
+			  [ValueHi] "r" (v.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -6336,15 +8663,7 @@ extern "C" {
 	/// @return Values after exchanging center values
 	FORCEINLINE CONST m128u16 mm_xchgcenter_epu16(m128u16 v)
 	{
-		m128u16 result;
-
-		asm(
-			"pexch %[Result],%[Value]"
-			: [Result] "=r" (result)
-			: [Value] "r" (v)
-		);
-
-		return result;
+		return mm_castepu16_epi16(mm_xchgcenter_epi16(mm_castepi16_epu16(v)));
 	}
 
 	/// @brief PEXCW : Parallel EXchange Center Word
@@ -6354,13 +8673,25 @@ extern "C" {
 	/// @return Value after exchanging elements
 	FORCEINLINE CONST m128i32 mm_xchgcenter_epi32(m128i32 v)
 	{
-		m128i32 result;
+		m128i32 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pexcw %[Result],%[Value]"
-			: [Result] "=r" (result)
-			: [Value] "r" (v)
+			"pexcw	%[Result],%[Value]"
+			: [Result] "=r" (result.v)
+			: [Value] "r" (v.v)
 		);
+#else
+		asm(
+			"pcpyld	%[ValueLo],%[ValueHi],%[ValueHi]\n\t"
+			"pexcw	%[ResultLo],%[ValueLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [ValueLo] "r" (v.lo),
+			  [ValueHi] "r" (v.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -6372,15 +8703,7 @@ extern "C" {
 	/// @return Value after exchanging elements
 	FORCEINLINE CONST m128u32 mm_xchgcenter_epu32(m128u32 v)
 	{
-		m128u32 result;
-
-		asm(
-			"pexew %[Result],%[Value]"
-			: [Result] "=r" (result)
-			: [Value] "r" (v)
-		);
-
-		return result;
+		return mm_castepu32_epi32(mm_xchgcenter_epi32(mm_castepi32_epu32(v)));
 	}
 
 	/// @brief PEXEH : Parallel EXchange Even Halfword
@@ -6392,13 +8715,25 @@ extern "C" {
 	/// @return Values after exchanging center values
 	FORCEINLINE CONST m128i16 mm_xchgeven_epi16(m128i16 v)
 	{
-		m128i16 result;
+		m128i16 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pexeh %[Result],%[Value]"
-			: [Result] "=r" (result)
-			: [Value] "r" (v)
+			"pexeh	%[Result],%[Value]"
+			: [Result] "=r" (result.v)
+			: [Value] "r" (v.v)
 		);
+#else
+		asm(
+			"pcpyld	%[ValueLo],%[ValueHi],%[ValueHi]\n\t"
+			"pexeh	%[ResultLo],%[ValueLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [ValueLo] "r" (v.lo),
+			  [ValueHi] "r" (v.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -6412,15 +8747,7 @@ extern "C" {
 	/// @return Values after exchanging center values
 	FORCEINLINE CONST m128u16 mm_xchgeven_epu16(m128u16 v)
 	{
-		m128u16 result;
-
-		asm(
-			"pexeh %[Result],%[Value]"
-			: [Result] "=r" (result)
-			: [Value] "r" (v)
-		);
-
-		return result;
+		return mm_castepu16_epi16(mm_xchgeven_epi16(mm_castepi16_epu16(v)));
 	}
 
 	/// @brief PEXEW : Parallel EXchange Even Word
@@ -6430,13 +8757,25 @@ extern "C" {
 	/// @return Value after exchanging elements
 	FORCEINLINE CONST m128i32 mm_xchgeven_epi32(m128i32 v)
 	{
-		m128i32 result;
+		m128i32 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pexew %[Result],%[Value]"
-			: [Result] "=r" (result)
-			: [Value] "r" (v)
+			"pexew	%[Result],%[Value]"
+			: [Result] "=r" (result.v)
+			: [Value] "r" (v.v)
 		);
+#else
+		asm(
+			"pcpyld	%[ValueLo],%[ValueHi],%[ValueHi]\n\t"
+			"pexew	%[ResultLo],%[ValueLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [ValueLo] "r" (v.lo),
+			  [ValueHi] "r" (v.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -6448,15 +8787,7 @@ extern "C" {
 	/// @return Value after exchanging elements
 	FORCEINLINE CONST m128u32 mm_xchgeven_epu32(m128u32 v)
 	{
-		m128u32 result;
-
-		asm(
-			"pexew %[Result],%[Value]"
-			: [Result] "=r" (result)
-			: [Value] "r" (v)
-		);
-
-		return result;
+		return mm_castepu32_epi32(mm_xchgeven_epi32(mm_castepi32_epu32(v)));
 	}
 
 	/// @brief PREVH : Parallel REVerse Halfword
@@ -6468,13 +8799,25 @@ extern "C" {
 	/// @return Value after reversing elements
 	FORCEINLINE CONST m128i16 mm_reverse_epi16(m128i16 v)
 	{
-		m128i16 result;
+		m128i16 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"prevh %[Result],%[Value]"
-			: [Result] "=r" (result)
-			: [Value] "r" (v)
+			"prevh	%[Result],%[Value]"
+			: [Result] "=r" (result.v)
+			: [Value] "r" (v.v)
 		);
+#else
+		asm(
+			"pcpyld	%[ValueLo],%[ValueHi],%[ValueHi]\n\t"
+			"prevh	%[ResultLo],%[ValueLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [ValueLo] "r" (v.lo),
+			  [ValueHi] "r" (v.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -6488,15 +8831,7 @@ extern "C" {
 	/// @return Value after reversing elements
 	FORCEINLINE CONST m128u16 mm_reverse_epu16(m128u16 v)
 	{
-		m128u16 result;
-
-		asm(
-			"prevh %[Result],%[Value]"
-			: [Result] "=r" (result)
-			: [Value] "r" (v)
-		);
-
-		return result;
+		return mm_castepu16_epi16(mm_reverse_epi16(mm_castepi16_epu16(v)));
 	}
 
 	/// @brief PROT3W: Parallel ROTate 3 Words left
@@ -6507,13 +8842,25 @@ extern "C" {
 	/// @return Value after rotating words
 	FORCEINLINE CONST m128i32 mm_rot3_epi32(m128i32 v)
 	{
-		m128i32 result;
+		m128i32 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"prot3w %[Result],%[Value]"
-			: [Result] "=r" (result)
-			: [Value] "r" (v)
+			"prot3w	%[Result],%[Value]"
+			: [Result] "=r" (result.v)
+			: [Value] "r" (v.v)
 		);
+#else
+		asm(
+			"pcpyld	%[ValueLo],%[ValueHi],%[ValueHi]\n\t"
+			"prot3w	%[ResultLo],%[ValueLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [ValueLo] "r" (v.lo),
+			  [ValueHi] "r" (v.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -6526,15 +8873,7 @@ extern "C" {
 	/// @return Value after rotating words
 	FORCEINLINE CONST m128u32 mm_rot3_epu32(m128u32 v)
 	{
-		m128u32 result;
-
-		asm(
-			"prot3w %[Result],%[Value]"
-			: [Result] "=r" (result)
-			: [Value] "r" (v)
-		);
-
-		return result;
+		return mm_castepu32_epi32(mm_rot3_epi32(mm_castepi32_epu32(v)));
 	}
 
 	/// @brief PEXTLB : Parallel EXTend Lower from Byte
@@ -6554,13 +8893,29 @@ extern "C" {
 	/// @return Interleaved values from both arguments
 	FORCEINLINE CONST m128i8 mm_extlo_epi8(m128i8 even, m128i8 odd)
 	{
-		m128i8 result;
+		m128i8 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pextlb %[Result],%[Odd],%[Even]"
-			: [Result] "=r" (result)
-			: [Even] "r" (even), [Odd] "r" (odd)
+			"pextlb	%[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result.v)
+			: [Even] "r" (even.v),
+			  [Odd] "r" (odd.v)
 		);
+#else
+		asm(
+			"pcpyld	%[OddLo],%[OddHi],%[OddLo]\n\t"
+			"pcpyld	%[EvenLo],%[EvenHi],%[EvenLo]\n\t"
+			"pextlb	%[ResultLo],%[OddLo],%[EvenLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [OddLo] "r" (odd.lo),
+			  [OddHi] "r" (odd.hi),
+			  [EvenLo] "r" (even.lo),
+			  [EvenHi] "r" (even.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -6582,15 +8937,7 @@ extern "C" {
 	/// @return Interleaved values from both arguments
 	FORCEINLINE CONST m128u8 mm_extlo_epu8(m128u8 even, m128u8 odd)
 	{
-		m128u8 result;
-
-		asm(
-			"pextlb %[Result],%[Odd],%[Even]"
-			: [Result] "=r" (result)
-			: [Even] "r" (even), [Odd] "r" (odd)
-		);
-
-		return result;
+		return mm_castepu8_epi8(mm_extlo_epi8(mm_castepi8_epu8(even), mm_castepi8_epu8(odd)));
 	}
 
 	/// @brief PEXTUB : Parallel EXTend Upper from Byte
@@ -6610,13 +8957,29 @@ extern "C" {
 	/// @return Interleaved values from both arguments
 	FORCEINLINE CONST m128i8 mm_exthi_epi8(m128i8 even, m128i8 odd)
 	{
-		m128i8 result;
+		m128i8 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pextub %[Result],%[Odd],%[Even]"
-			: [Result] "=r" (result)
-			: [Even] "r" (even), [Odd] "r" (odd)
+			"pextub	%[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result.v)
+			: [Even] "r" (even.v),
+			  [Odd] "r" (odd.v)
 		);
+#else
+		asm(
+			"pcpyld	%[OddLo],%[OddHi],%[OddLo]\n\t"
+			"pcpyld	%[EvenLo],%[EvenHi],%[EvenLo]\n\t"
+			"pextub	%[ResultLo],%[OddLo],%[EvenLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [OddLo] "r" (odd.lo),
+			  [OddHi] "r" (odd.hi),
+			  [EvenLo] "r" (even.lo),
+			  [EvenHi] "r" (even.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -6638,15 +9001,7 @@ extern "C" {
 	/// @return Interleaved values from both arguments
 	FORCEINLINE CONST m128u8 mm_exthi_epu8(m128u8 even, m128u8 odd)
 	{
-		m128u8 result;
-
-		asm(
-			"pextub %[Result],%[Odd],%[Even]"
-			: [Result] "=r" (result)
-			: [Even] "r" (even), [Odd] "r" (odd)
-		);
-
-		return result;
+		return mm_castepu8_epi8(mm_exthi_epi8(mm_castepi8_epu8(even), mm_castepi8_epu8(odd)));
 	}
 
 	/// @brief PEXTLH : Parallel EXTend Lower from Halfword
@@ -6666,13 +9021,29 @@ extern "C" {
 	/// @return Interleaved values from both arguments
 	FORCEINLINE CONST m128i16 mm_extlo_epi16(m128i16 even, m128i16 odd)
 	{
-		m128i16 result;
+		m128i16 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pextlh %[Result],%[Odd],%[Even]"
-			: [Result] "=r" (result)
-			: [Even] "r" (even), [Odd] "r" (odd)
+			"pextlh	%[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result.v)
+			: [Even] "r" (even.v),
+			  [Odd] "r" (odd.v)
 		);
+#else
+		asm(
+			"pcpyld	%[OddLo],%[OddHi],%[OddLo]\n\t"
+			"pcpyld	%[EvenLo],%[EvenHi],%[EvenLo]\n\t"
+			"pextlh	%[ResultLo],%[OddLo],%[EvenLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [OddLo] "r" (odd.lo),
+			  [OddHi] "r" (odd.hi),
+			  [EvenLo] "r" (even.lo),
+			  [EvenHi] "r" (even.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -6694,15 +9065,7 @@ extern "C" {
 	/// @return Interleaved values from both arguments
 	FORCEINLINE CONST m128u16 mm_extlo_epu16(m128u16 even, m128u16 odd)
 	{
-		m128u16 result;
-
-		asm(
-			"pextlh %[Result],%[Odd],%[Even]"
-			: [Result] "=r" (result)
-			: [Even] "r" (even), [Odd] "r" (odd)
-		);
-
-		return result;
+		return mm_castepu16_epi16(mm_extlo_epi16(mm_castepi16_epu16(even), mm_castepi16_epu16(odd)));
 	}
 
 	/// @brief PEXTUH : Parallel EXTend Upper from Halfword
@@ -6722,13 +9085,29 @@ extern "C" {
 	/// @return Interleaved values from both arguments
 	FORCEINLINE CONST m128i16 mm_exthi_epi16(m128i16 even, m128i16 odd)
 	{
-		m128i16 result;
+		m128i16 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pextuh %[Result],%[Odd],%[Even]"
-			: [Result] "=r" (result)
-			: [Even] "r" (even), [Odd] "r" (odd)
+			"pextuh	%[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result.v)
+			: [Even] "r" (even.v),
+			  [Odd] "r" (odd.v)
 		);
+#else
+		asm(
+			"pcpyld	%[OddLo],%[OddHi],%[OddLo]\n\t"
+			"pcpyld	%[EvenLo],%[EvenHi],%[EvenLo]\n\t"
+			"pextuh	%[ResultLo],%[OddLo],%[EvenLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [OddLo] "r" (odd.lo),
+			  [OddHi] "r" (odd.hi),
+			  [EvenLo] "r" (even.lo),
+			  [EvenHi] "r" (even.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -6750,15 +9129,7 @@ extern "C" {
 	/// @return Interleaved values from both arguments
 	FORCEINLINE CONST m128u16 mm_exthi_epu16(m128u16 even, m128u16 odd)
 	{
-		m128u16 result;
-
-		asm(
-			"pextuh %[Result],%[Odd],%[Even]"
-			: [Result] "=r" (result)
-			: [Even] "r" (even), [Odd] "r" (odd)
-		);
-
-		return result;
+		return mm_castepu16_epi16(mm_exthi_epi16(mm_castepi16_epu16(even), mm_castepi16_epu16(odd)));
 	}
 
 	/// @brief PEXTLW : Parallel EXTend Lower from Word
@@ -6777,13 +9148,29 @@ extern "C" {
 	/// @return Interleaved values from both arguments
 	FORCEINLINE CONST m128i32 mm_extlo_epi32(m128i32 even, m128i32 odd)
 	{
-		m128i32 result;
+		m128i32 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pextlw %[Result],%[Odd],%[Even]"
-			: [Result] "=r" (result)
-			: [Even] "r" (even), [Odd] "r" (odd)
+			"pextlw	%[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result.v)
+			: [Even] "r" (even.v),
+			  [Odd] "r" (odd.v)
 		);
+#else
+		asm(
+			"pcpyld	%[OddLo],%[OddHi],%[OddLo]\n\t"
+			"pcpyld	%[EvenLo],%[EvenHi],%[EvenLo]\n\t"
+			"pextlw	%[ResultLo],%[OddLo],%[EvenLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [OddLo] "r" (odd.lo),
+			  [OddHi] "r" (odd.hi),
+			  [EvenLo] "r" (even.lo),
+			  [EvenHi] "r" (even.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -6804,15 +9191,7 @@ extern "C" {
 	/// @return Interleaved values from both arguments
 	FORCEINLINE CONST m128u32 mm_extlo_epu32(m128u32 even, m128u32 odd)
 	{
-		m128u32 result;
-
-		asm(
-			"pextlw %[Result],%[Odd],%[Even]"
-			: [Result] "=r" (result)
-			: [Even] "r" (even), [Odd] "r" (odd)
-		);
-
-		return result;
+		return mm_castepu32_epi32(mm_extlo_epi32(mm_castepi32_epu32(even), mm_castepi32_epu32(odd)));
 	}
 
 	/// @brief PEXTUW : Parallel EXTend Upper from Word
@@ -6831,13 +9210,29 @@ extern "C" {
 	/// @return Interleaved values from both arguments
 	FORCEINLINE CONST m128i32 mm_exthi_epi32(m128i32 even, m128i32 odd)
 	{
-		m128i32 result;
+		m128i32 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pextuw %[Result],%[Odd],%[Even]"
-			: [Result] "=r" (result)
-			: [Even] "r" (even), [Odd] "r" (odd)
+			"pextuw	%[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result.v)
+			: [Even] "r" (even.v),
+			  [Odd] "r" (odd.v)
 		);
+#else
+		asm(
+			"pcpyld	%[OddLo],%[OddHi],%[OddLo]\n\t"
+			"pcpyld	%[EvenLo],%[EvenHi],%[EvenLo]\n\t"
+			"pextuw	%[ResultLo],%[OddLo],%[EvenLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [OddLo] "r" (odd.lo),
+			  [OddHi] "r" (odd.hi),
+			  [EvenLo] "r" (even.lo),
+			  [EvenHi] "r" (even.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -6858,15 +9253,7 @@ extern "C" {
 	/// @return Interleaved values from both arguments
 	FORCEINLINE CONST m128u32 mm_exthi_epu32(m128u32 even, m128u32 odd)
 	{
-		m128u32 result;
-
-		asm(
-			"pextuw %[Result],%[Odd],%[Even]"
-			: [Result] "=r" (result)
-			: [Even] "r" (even), [Odd] "r" (odd)
-		);
-
-		return result;
+		return mm_castepu32_epi32(mm_exthi_epi32(mm_castepi32_epu32(even), mm_castepi32_epu32(odd)));
 	}
 
 	/// @brief PINTEH : Parallel INTerleave Even Halfword
@@ -6886,13 +9273,29 @@ extern "C" {
 	/// @return Interleaved values
 	FORCEINLINE CONST m128i16 mm_interleaveeven_epi16(m128i16 even, m128i16 odd)
 	{
-		m128i16 result;
+		m128i16 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pinteh %[Result],%[Odd],%[Even]"
-			: [Result] "=r" (result)
-			: [Odd] "r" (odd), [Even] "r" (even)
+			"pinteh	%[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result.v)
+			: [Even] "r" (even.v),
+			  [Odd] "r" (odd.v)
 		);
+#else
+		asm(
+			"pcpyld	%[OddLo],%[OddHi],%[OddLo]\n\t"
+			"pcpyld	%[EvenLo],%[EvenHi],%[EvenLo]\n\t"
+			"pinteh	%[ResultLo],%[OddLo],%[EvenLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [OddLo] "r" (odd.lo),
+			  [OddHi] "r" (odd.hi),
+			  [EvenLo] "r" (even.lo),
+			  [EvenHi] "r" (even.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -6914,15 +9317,7 @@ extern "C" {
 	/// @return Interleaved values
 	FORCEINLINE CONST m128u16 mm_interleaveeven_epu16(m128u16 even, m128u16 odd)
 	{
-		m128u16 result;
-
-		asm(
-			"pinteh %[Result],%[Odd],%[Even]"
-			: [Result] "=r" (result)
-			: [Odd] "r" (odd), [Even] "r" (even)
-		);
-
-		return result;
+		return mm_castepu16_epi16(mm_interleaveeven_epi16(mm_castepi16_epu16(even), mm_castepi16_epu16(odd)));
 	}
 
 	/// @brief PINTH : Parallel INTerleave Halfword
@@ -6942,13 +9337,29 @@ extern "C" {
 	/// @return Interleaved values
 	FORCEINLINE CONST m128i16 mm_interleavelohi_epi16(m128i16 even, m128i16 odd)
 	{
-		m128i16 result;
+		m128i16 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pinth %[Result],%[Odd],%[Even]"
-			: [Result] "=r" (result)
-			: [Odd] "r" (odd), [Even] "r" (even)
+			"pinth	%[Result],%[Odd],%[Even]"
+			: [Result] "=r" (result.v)
+			: [Even] "r" (even.v),
+			  [Odd] "r" (odd.v)
 		);
+#else
+		asm(
+			"pcpyld	%[OddLo],%[OddHi],%[OddLo]\n\t"
+			"pcpyld	%[EvenLo],%[EvenHi],%[EvenLo]\n\t"
+			"pinth	%[ResultLo],%[OddLo],%[EvenLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [OddLo] "r" (odd.lo),
+			  [OddHi] "r" (odd.hi),
+			  [EvenLo] "r" (even.lo),
+			  [EvenHi] "r" (even.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -6970,15 +9381,7 @@ extern "C" {
 	/// @return Interleaved values
 	FORCEINLINE CONST m128u16 mm_interleavelohi_epu16(m128u16 even, m128u16 odd)
 	{
-		m128u16 result;
-
-		asm(
-			"pinth %[Result],%[Odd],%[Even]"
-			: [Result] "=r" (result)
-			: [Odd] "r" (odd), [Even] "r" (even)
-		);
-
-		return result;
+		return mm_castepu16_epi16(mm_interleavelohi_epi16(mm_castepi16_epu16(even), mm_castepi16_epu16(odd)));
 	}
 
 	/// @brief PPACB : Parallel PACk to Byte
@@ -6997,13 +9400,29 @@ extern "C" {
 	/// @return Packed values of both arguments
 	FORCEINLINE CONST m128i8 mm_pack_epi8(m128i8 lo, m128i8 hi)
 	{
-		m128i8 result;
+		m128i8 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"ppacb %[Result],%[Hi],%[Lo]"
-			: [Result] "=r" (result)
-			: [Lo] "r" (lo), [Hi] "r" (hi)
+			"ppacb	%[Result],%[Hi],%[Lo]"
+			: [Result] "=r" (result.v)
+			: [Lo] "r" (lo.v),
+			  [Hi] "r" (hi.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LoLo],%[LoHi],%[LoLo]\n\t"
+			"pcpyld	%[HiLo],%[HiHi],%[HiLo]\n\t"
+			"ppacb	%[ResultLo],%[HiLo],%[LoLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LoLo] "r" (lo.lo),
+			  [LoHi] "r" (lo.hi),
+			  [HiLo] "r" (hi.lo),
+			  [HiHi] "r" (hi.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -7024,15 +9443,7 @@ extern "C" {
 	/// @return Packed values of both arguments
 	FORCEINLINE CONST m128u8 mm_pack_epu8(m128u8 lo, m128u8 hi)
 	{
-		m128u8 result;
-
-		asm(
-			"ppacb %[Result],%[Hi],%[Lo]"
-			: [Result] "=r" (result)
-			: [Lo] "r" (lo), [Hi] "r" (hi)
-		);
-
-		return result;
+		return mm_castepu8_epi8(mm_pack_epi8(mm_castepi8_epu8(lo), mm_castepi8_epu8(hi)));
 	}
 
 	/// @brief PPACH : Parallel PACk to Halfword
@@ -7051,13 +9462,29 @@ extern "C" {
 	/// @return Packed values of both arguments
 	FORCEINLINE CONST m128i16 mm_pack_epi16(m128i16 lo, m128i16 hi)
 	{
-		m128i16 result;
+		m128i16 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"ppach %[Result],%[Hi],%[Lo]"
-			: [Result] "=r" (result)
-			: [Lo] "r" (lo), [Hi] "r" (hi)
+			"ppach	%[Result],%[Hi],%[Lo]"
+			: [Result] "=r" (result.v)
+			: [Lo] "r" (lo.v),
+			  [Hi] "r" (hi.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LoLo],%[LoHi],%[LoLo]\n\t"
+			"pcpyld	%[HiLo],%[HiHi],%[HiLo]\n\t"
+			"ppach	%[ResultLo],%[HiLo],%[LoLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LoLo] "r" (lo.lo),
+			  [LoHi] "r" (lo.hi),
+			  [HiLo] "r" (hi.lo),
+			  [HiHi] "r" (hi.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -7078,15 +9505,7 @@ extern "C" {
 	/// @return Packed values of both arguments
 	FORCEINLINE CONST m128u16 mm_pack_epu16(m128u16 lo, m128u16 hi)
 	{
-		m128u16 result;
-
-		asm(
-			"ppach %[Result],%[Hi],%[Lo]"
-			: [Result] "=r" (result)
-			: [Lo] "r" (lo), [Hi] "r" (hi)
-		);
-
-		return result;
+		return mm_castepu16_epi16(mm_pack_epi16(mm_castepi16_epu16(lo), mm_castepi16_epu16(hi)));
 	}
 
 	/// @brief PPACW : Parallel PACk to Word
@@ -7104,13 +9523,29 @@ extern "C" {
 	/// @return Packed values of both arguments
 	FORCEINLINE CONST m128i32 mm_pack_epi32(m128i32 lo, m128i32 hi)
 	{
-		m128i32 result;
+		m128i32 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"ppacw %[Result],%[Hi],%[Lo]"
-			: [Result] "=r" (result)
-			: [Lo] "r" (lo), [Hi] "r" (hi)
+			"ppacw	%[Result],%[Hi],%[Lo]"
+			: [Result] "=r" (result.v)
+			: [Lo] "r" (lo.v),
+			  [Hi] "r" (hi.v)
 		);
+#else
+		asm(
+			"pcpyld	%[LoLo],%[LoHi],%[LoLo]\n\t"
+			"pcpyld	%[HiLo],%[HiHi],%[HiLo]\n\t"
+			"ppacw	%[ResultLo],%[HiLo],%[LoLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [LoLo] "r" (lo.lo),
+			  [LoHi] "r" (lo.hi),
+			  [HiLo] "r" (hi.lo),
+			  [HiHi] "r" (hi.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -7130,15 +9565,7 @@ extern "C" {
 	/// @return Packed values of both arguments
 	FORCEINLINE CONST m128u32 mm_pack_epu32(m128u32 lo, m128u32 hi)
 	{
-		m128u32 result;
-
-		asm(
-			"ppacw %[Result],%[Hi],%[Lo]"
-			: [Result] "=r" (result)
-			: [Lo] "r" (lo), [Hi] "r" (hi)
-		);
-
-		return result;
+		return mm_castepu32_epi32(mm_pack_epi32(mm_castepi32_epu32(lo), mm_castepi32_epu32(hi)));
 	}
 
 	/// @brief PEXT5 : Parallel EXTend from 5 bits
@@ -7150,13 +9577,25 @@ extern "C" {
 	/// @return Values converted to 8-8-8-8
 	FORCEINLINE CONST m128u32 mm_ext5_epu16(m128u16 v)
 	{
-		m128u32 result;
+		m128u32 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"pext5 %[Result],%[Value]"
-			: [Result] "=r" (result)
-			: [Value] "r" (v)
+			"pext5	%[Result],%[Value]"
+			: [Result] "=r" (result.v)
+			: [Value] "r" (v.v)
 		);
+#else
+		asm(
+			"pcpyld	%[ValueLo],%[ValueHi],%[ValueHi]\n\t"
+			"pext5	%[ResultLo],%[ValueLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [ValueLo] "r" (v.lo),
+			  [ValueHi] "r" (v.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -7171,13 +9610,25 @@ extern "C" {
 	/// @return Values converted to 1-5-5-5
 	FORCEINLINE CONST m128u16 mm_pack5_epu32(m128u32 v)
 	{
-		m128u16 result;
+		m128u16 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"ppac5 %[Result],%[Value]"
-			: [Result] "=r" (result)
-			: [Value] "r" (v)
+			"ppac5	%[Result],%[Value]"
+			: [Result] "=r" (result.v)
+			: [Value] "r" (v.v)
 		);
+#else
+		asm(
+			"pcpyld	%[ValueLo],%[ValueHi],%[ValueHi]\n\t"
+			"ppac5	%[ResultLo],%[ValueLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [ValueLo] "r" (v.lo),
+			  [ValueHi] "r" (v.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -7192,13 +9643,25 @@ extern "C" {
 	/// @return Amount of same leading bits minus 1
 	FORCEINLINE CONST m128u32 mm_clb_epi32(m128i32 v)
 	{
-		m128u32 result;
+		m128u32 result = {};
 
+#ifdef PS2INTRIN_UNSAFE
 		asm(
-			"plzcw %[Result],%[Value]"
-			: [Result] "=r" (result)
-			: [Value] "r" (v)
+			"plzcw	%[Result],%[Value]"
+			: [Result] "=r" (result.v)
+			: [Value] "r" (v.v)
 		);
+#else
+		asm(
+			"pcpyld	%[ValueLo],%[ValueHi],%[ValueLo]\n\t"
+			"plzcw	%[ResultLo],%[ValueLo]\n\t"
+			"pcpyud	%[ResultHi],%[ResultLo],%[ResultLo]"
+			: [ResultLo] "=r" (result.lo),
+			  [ResultHi] "=&r" (result.hi)
+			: [ValueLo] "r" (v.lo),
+			  [ValueHi] "r" (v.hi)
+		);
+#endif
 
 		return result;
 	}
@@ -7213,15 +9676,7 @@ extern "C" {
 	/// @return Amount of same leading bits minus 1
 	FORCEINLINE CONST m128u32 mm_clb_epu32(m128u32 v)
 	{
-		m128u32 result;
-
-		asm(
-			"plzcw %[Result],%[Value]"
-			: [Result] "=r" (result)
-			: [Value] "r" (v)
-		);
-
-		return result;
+		return mm_clb_epi32(mm_castepi32_epu32(v));
 	}
 
 	/// @brief PLZCW : Parallel Leading Zero or one Count Word
@@ -7236,10 +9691,10 @@ extern "C" {
 	/// of the input
 	FORCEINLINE CONST uint64_t mm_clb_u64(uint64_t v)
 	{
-		uint64_t result;
+		uint64_t result = {};
 
 		asm(
-			"plzcw %[Result],%[Value]"
+			"plzcw	%[Result],%[Value]"
 			: [Result] "=r" (result)
 			: [Value] "r" (v)
 		);
@@ -7304,11 +9759,12 @@ namespace
 	/// This function writes to global state (SA).
 	/// @tparam FixedByteAmount The compile time constant byte-amount to set up the shift amount
 	/// register for
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param byte_amount The variable byte-amount to set up the shift amount register for
 	template <unsigned FixedByteAmount>
-	FORCEINLINE void set_sa_8(unsigned byte_amount) noexcept
+	FORCEINLINE void set_sa_8(sa_state_t* state, unsigned byte_amount) noexcept
 	{
-		MTSAB_BOTH(byte_amount, (FixedByteAmount));
+		MTSAB_BOTH(state, byte_amount, (FixedByteAmount));
 	}
 
 	/// @brief MTSAB : Move byte count To Shift Amount register (Byte)
@@ -7327,10 +9783,11 @@ namespace
 	/// This function writes to global state (SA).
 	/// @tparam FixedByteAmount The compile time constant byte-amount to set up the shift amount
 	/// register for
+	/// @param state Additional state used in safe mode. May not be NULL.
 	template <unsigned FixedByteAmount>
-	FORCEINLINE void set_sa_8() noexcept
+	FORCEINLINE void set_sa_8(sa_state_t* state) noexcept
 	{
-		MTSAB_IMMEDIATE((FixedByteAmount));
+		MTSAB_IMMEDIATE(state, (FixedByteAmount));
 	}
 
 	/// @brief MTSAH : Move halfword count To Shift Amount register (Halfword)
@@ -7350,12 +9807,13 @@ namespace
 	/// This function writes to global state (SA).
 	/// @tparam FixedHalfwordAmount The compile time constant halfword-amount to set up the shift
 	/// amount register for
+	/// @param state Additional state used in safe mode. May not be NULL.
 	/// @param halfword_amount The variable halfword-amount to set up the shift amount register
 	/// for
 	template <unsigned FixedHalfwordAmount>
-	FORCEINLINE void set_sa_16(unsigned halfword_amount) noexcept
+	FORCEINLINE void set_sa_16(sa_state_t* state, unsigned halfword_amount) noexcept
 	{
-		MTSAH_BOTH(halfword_amount, (FixedHalfwordAmount));
+		MTSAH_BOTH(state, halfword_amount, (FixedHalfwordAmount));
 	}
 
 	/// @brief MTSAH : Move halfword count To Shift Amount register (Halfword)
@@ -7375,10 +9833,11 @@ namespace
 	/// This function writes to global state (SA).
 	/// @tparam FixedHalfwordAmount The compile time constant halfword-amount to set up the shift
 	/// amount register for
+	/// @param state Additional state used in safe mode. May not be NULL.
 	template <unsigned FixedHalfwordAmount>
-	FORCEINLINE void set_sa_16() noexcept
+	FORCEINLINE void set_sa_16(sa_state_t* state) noexcept
 	{
-		MTSAH_IMMEDIATE((FixedHalfwordAmount));
+		MTSAH_IMMEDIATE(state, (FixedHalfwordAmount));
 	}
 
 	/// @brief PSLLH : Parallel Shift Left Logical Halfword
@@ -7390,7 +9849,7 @@ namespace
 	template <unsigned ShiftAmount>
 	FORCEINLINE CONST m128i16 mm_sll_epi16(m128i16 v) noexcept
 	{
-		m128i16 result;
+		m128i16 result = {};
 
 		PSLLH(result, v, (ShiftAmount));
 
@@ -7406,11 +9865,7 @@ namespace
 	template <unsigned ShiftAmount>
 	FORCEINLINE CONST m128u16 mm_sll_epu16(m128u16 v) noexcept
 	{
-		m128u16 result;
-
-		PSLLH(result, v, (ShiftAmount));
-
-		return result;
+		return mm_castepu16_epi16(mm_sll_epi16<ShiftAmount>(mm_castepi16_epu16(v)));
 	}
 
 	/// @brief PSLLW : Parallel Shift Left Logical Word
@@ -7422,7 +9877,7 @@ namespace
 	template <unsigned ShiftAmount>
 	FORCEINLINE CONST m128i32 mm_sll_epi32(m128i32 v) noexcept
 	{
-		m128i32 result;
+		m128i32 result = {};
 
 		PSLLW(result, v, (ShiftAmount));
 
@@ -7438,11 +9893,7 @@ namespace
 	template <unsigned ShiftAmount>
 	FORCEINLINE CONST m128u32 mm_sll_epu32(m128u32 v) noexcept
 	{
-		m128u32 result;
-
-		PSLLW(result, v, (ShiftAmount));
-
-		return result;
+		return mm_castepu32_epi32(mm_sll_epi32<ShiftAmount>(mm_castepi32_epu32(v)));
 	}
 
 	/// @brief PSRAH : Parallel Shift Right Arithmetic Halfword
@@ -7455,7 +9906,7 @@ namespace
 	template <unsigned ShiftAmount>
 	FORCEINLINE CONST m128i16 mm_sra_epi16(m128i16 v) noexcept
 	{
-		m128i16 result;
+		m128i16 result = {};
 
 		PSRAH(result, v, (ShiftAmount));
 
@@ -7472,7 +9923,7 @@ namespace
 	template <unsigned ShiftAmount>
 	FORCEINLINE CONST m128i32 mm_sra_epi32(m128i32 v) noexcept
 	{
-		m128i32 result;
+		m128i32 result = {};
 
 		PSRAW(result, v, (ShiftAmount));
 
@@ -7489,7 +9940,7 @@ namespace
 	template <unsigned ShiftAmount>
 	FORCEINLINE CONST m128u16 mm_srl_epu16(m128i16 v) noexcept
 	{
-		m128u16 result;
+		m128u16 result = {};
 
 		PSRLH(result, v, (ShiftAmount));
 
@@ -7506,12 +9957,38 @@ namespace
 	template <unsigned ShiftAmount>
 	FORCEINLINE CONST m128u32 mm_srl_epu32(m128u32 v) noexcept
 	{
-		m128u32 result;
+		m128u32 result = {};
 
 		PSRLW(result, v, (ShiftAmount));
 
 		return result;
 	}
+
+
+	static_assert(alignof(int128_t) == 16);
+	static_assert(alignof(uint128_t) == 16);
+	static_assert(alignof(m128i8) == 16);
+	static_assert(alignof(m128u8) == 16);
+	static_assert(alignof(m128i16) == 16);
+	static_assert(alignof(m128u16) == 16);
+	static_assert(alignof(m128i32) == 16);
+	static_assert(alignof(m128u32) == 16);
+	static_assert(alignof(m128i64) == 16);
+	static_assert(alignof(m128u64) == 16);
+	static_assert(alignof(m128i128) == 16);
+	static_assert(alignof(m128u128) == 16);
+	static_assert(sizeof(int128_t) == 16);
+	static_assert(sizeof(uint128_t) == 16);
+	static_assert(sizeof(m128i8) == 16);
+	static_assert(sizeof(m128u8) == 16);
+	static_assert(sizeof(m128i16) == 16);
+	static_assert(sizeof(m128u16) == 16);
+	static_assert(sizeof(m128i32) == 16);
+	static_assert(sizeof(m128u32) == 16);
+	static_assert(sizeof(m128i64) == 16);
+	static_assert(sizeof(m128u64) == 16);
+	static_assert(sizeof(m128i128) == 16);
+	static_assert(sizeof(m128u128) == 16);
 }
 #endif
 
@@ -7520,5 +9997,8 @@ namespace
 #undef UNSEQUENCED
 #undef PURE
 #undef REPRODUCIBLE
+#undef ALIGNAS16
+#undef DECLAREVECTOR_UNSAFE
+#undef DECLAREVECTOR_SAFE
 #undef DECLAREVECTOR
 #undef MODE_TI
