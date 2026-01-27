@@ -19,7 +19,7 @@ The multiply and the multiply-accummulate instructions in pipeline 0 behave simi
 Because they use the LO and HI registers, any modification to those will be observed when finally querying the result.
 This means that any multiplication in the code, even for i.e. address calculations, will overwrite the result of the multiply/multiply-accummulate instruction
 if it is not saved using the move-from-lo/hi instructions (and then restored using move-to-lo/hi).
-High optimization levels tend to remove extraneous multiplactions, making those roundtrips unnecessary.
+High optimization levels tend to remove extraneous multiplications, making those roundtrips unnecessary.
 
 <h3>List of covered instructions : </h3>
 
