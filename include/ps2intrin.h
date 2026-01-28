@@ -1,30 +1,30 @@
 #pragma once
 
 /*
-*	<*intrin.h>-like wrapper functions for pipeline 1, multiply-add and multimedia instructions.
-*	Functions taking an immediate value as argument have macro versions exposing this
-*	functionality. C++ convenience wrappers are provided as well.
+*	<*intrin.h>-like wrapper functions for pipeline 1, multiply-add, and multimedia
+*	instructions. Functions taking an immediate value as an argument have macro versions
+*	exposing this functionality. C++ convenience wrappers are provided as well.
 *
 *	These functions are declared 'always_inline'. You should not take their addresses or call
 *	them using function pointers.
 * 
-*	The '__m128i' analogue are split up by integer type. There are plenty of no-op conversion
+*	The '__m128i' analogues are split up by integer type. There are plenty of no-op conversion
 *	functions. This is done to make integer type mismatches easier to notice. Do not store this
 *	type in memory and do not take the address of a variable using them. Treat every variable
 *	as though it were declared with the 'register' keyword.
 * 
 *	This library is using a safe mode with well-defined semantics for every function. This has
-*	considerable overhead, but guarantees correct results even in debug mode (-O0). Define
+*	considerable overhead but guarantees correct results even in debug mode (-O0). Define
 *	'PS2INTRIN_UNSAFE' to disable safe mode and 'PS2INTRIN_SILENCE_UNSAFE' to silence the
 *	warning. Unsafe mode assumes that all variables of 'm128*' type reside in registers at all
 *	times and that surrounding code does not modify the LO/HI/SA registers. This is always false
 *	in debug mode. Generated code should be checked manually for correctness.
 *	
 *	A note for developers looking to use these functions:
-*	The EE Core Multimedia Instructions have most support for these types: 'int16_t', 'int32_t'
-*	and 'uint32_t'. If you plan on using these functions you should make sure your data is in
-*	this format. The variants operating on 64-bit values are mostly just 32-bit values plus 32
-*	bits of sign extension, not real 64-bit integers.
+*	The EE Core Multimedia Instructions have the most support for these types: 'int16_t',
+*	'int32_t' and 'uint32_t'. If you plan on using these functions, you should make sure your
+*	data is in this format. The variants operating on 64-bit values are mostly just 32-bit values
+*	plus 32 bits of sign extension, not real 64-bit integers.
 */
 
 #ifndef _EE

@@ -1,21 +1,21 @@
 <h1>ps2intrin</h1>
-ps2intrin is a header-only library providing C-Function wrappers for EE-Core-specific instructions.
+ps2intrin is a header-only library providing C-function wrappers for EE-Core-specific instructions.
 
-This library works like other <*intrin.h> headers provided for other targets, i.e. <x86intrin.h>.
+This library works like other <*intrin.h> headers provided for other targets, i.e., <x86intrin.h>.
 
 There is also a minimal CMakeLists.txt provided for integration into CMake projects.
 
 <h3>Correctness</h3>
 
 By default, ps2intrin is in safe mode.
-This mode ensures correct behaviour as is intended by the intrinsics used.
+This mode ensures correct behavior as is intended by the intrinsics used.
 It achieves this by saving the expected state of the LO/HI/SA registers in user-allocated variables, as well as splitting 128-bit types into 2 registers.
-This comes at a large cost to performance, but is necessary to achieve correct results in debug builds (-O0).
+This comes at a large cost to performance but is necessary to achieve correct results in debug builds (-O0).
 Safe mode can be turned off by defining 'PS2INTRIN_UNSAFE' before including the header.
-In unsafe mode, 128-bit types will no longer be split up and external tracking of the LO/HI/SA registers is disabled.
+In unsafe mode, 128-bit types will no longer be split up, and external tracking of the LO/HI/SA registers is disabled.
 It is no longer guaranteed to produce the same results as safe mode, as the meaning of the resulting code is dependent on surrounding instructions and the
 presence or absence of compiler optimizations.
-Using an optimization level higher than -O0 is neccessary.
+Using an optimization level higher than -O0 is necessary.
 All instructions operating on the LO/HI/SA registers or on 128-bit types are affected by this switch.
 To achieve both correct and fast code, it is recommended to first write a correct routine using safe mode, then switch to unsafe mode, and check the resulting
 output for correctness (using tests or manually checking the assembly).
@@ -151,5 +151,5 @@ output for correctness (using tests or manually checking the assembly).
 
   ---
 
-  There are also helper functions provided for ease of use.
-  Those may compile to significantly more than a single instruction.
+There are also helper functions provided for ease of use.
+Those may compile to significantly more than a single instruction.
