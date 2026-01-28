@@ -5,21 +5,20 @@ This library works like other <*intrin.h> headers provided for other targets, i.
 
 There is also a minimal CMakeLists.txt provided for integration into CMake projects.
 
-<h3>Warning</h3>
+<h3>Correctness</h3>
 
-128-bit multimedia instructions only work with high optimization settings currently.
-This is due to GCC assuming 128-bit values take up 2 adjacent 64-bit registers rather than one 128-bit register.
-Loading a quadword using the LQ instruction will correctly populate a single register but GCC will think it has actually written to that and the next register.
-These 2 registers are then i.e. spilled on the stack, etc.
-This obviously writes garbage.
-Only workaround is using i.e. -O3 on functions using these multimedia instructions and checking if the compiler actually allocated all values to registers
-and didn't have to spill any to the stack.
-
-The multiply and the multiply-accummulate instructions in pipeline 0 behave similarly.
-Because they use the LO and HI registers, any modification to those will be observed when finally querying the result.
-This means that any multiplication in the code, even for i.e. address calculations, will overwrite the result of the multiply/multiply-accummulate instruction
-if it is not saved using the move-from-lo/hi instructions (and then restored using move-to-lo/hi).
-High optimization levels tend to remove extraneous multiplications, making those roundtrips unnecessary.
+By default, ps2intrin is in safe mode.
+This mode ensures correct behaviour as is intended by the intrinsics used.
+It achieves this by saving the expected state of the LO/HI/SA registers in user-allocated variables, as well as splitting 128-bit types into 2 registers.
+This comes at a large cost to performance, but is necessary to achieve correct results in debug builds (-O0).
+Safe mode can be turned off by defining 'PS2INTRIN_UNSAFE' before including the header.
+In unsafe mode, 128-bit types will no longer be split up and external tracking of the LO/HI/SA registers is disabled.
+It is no longer guaranteed to produce the same results as safe mode, as the meaning of the resulting code is dependent on surrounding instructions and the
+presence or absence of compiler optimizations.
+Using an optimization level higher than -O0 is neccessary.
+All instructions operating on the LO/HI/SA registers or on 128-bit types are affected by this switch.
+To achieve both correct and fast code, it is recommended to first write a correct routine using safe mode, then switch to unsafe mode, and check the resulting
+output for correctness (using tests or manually checking the assembly).
 
 <h3>List of covered instructions : </h3>
 

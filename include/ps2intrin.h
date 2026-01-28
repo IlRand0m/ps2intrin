@@ -9,7 +9,16 @@
 *	them using function pointers.
 * 
 *	The '__m128i' analogue are split up by integer type. There are plenty of no-op conversion
-*	functions. This is done to make integer type mismatches easier to notice.
+*	functions. This is done to make integer type mismatches easier to notice. Do not store this
+*	type in memory and do not take the address of a variable using them. Treat every variable
+*	as though it were declared with the 'register' keyword.
+* 
+*	This library is using a safe mode with well-defined semantics for every function. This has
+*	considerable overhead, but guarantees correct results even in debug mode (-O0). Define
+*	'PS2INTRIN_UNSAFE' to disable safe mode and 'PS2INTRIN_SILENCE_UNSAFE' to silence the
+*	warning. Unsafe mode assumes that all variables of 'm128*' type reside in registers at all
+*	times and that surrounding code does not modify the LO/HI/SA registers. This is always false
+*	in debug mode. Generated code should be checked manually for correctness.
 *	
 *	A note for developers looking to use these functions:
 *	The EE Core Multimedia Instructions have most support for these types: 'int16_t', 'int32_t'
@@ -9963,32 +9972,6 @@ namespace
 
 		return result;
 	}
-
-
-	static_assert(alignof(int128_t) == 16);
-	static_assert(alignof(uint128_t) == 16);
-	static_assert(alignof(m128i8) == 16);
-	static_assert(alignof(m128u8) == 16);
-	static_assert(alignof(m128i16) == 16);
-	static_assert(alignof(m128u16) == 16);
-	static_assert(alignof(m128i32) == 16);
-	static_assert(alignof(m128u32) == 16);
-	static_assert(alignof(m128i64) == 16);
-	static_assert(alignof(m128u64) == 16);
-	static_assert(alignof(m128i128) == 16);
-	static_assert(alignof(m128u128) == 16);
-	static_assert(sizeof(int128_t) == 16);
-	static_assert(sizeof(uint128_t) == 16);
-	static_assert(sizeof(m128i8) == 16);
-	static_assert(sizeof(m128u8) == 16);
-	static_assert(sizeof(m128i16) == 16);
-	static_assert(sizeof(m128u16) == 16);
-	static_assert(sizeof(m128i32) == 16);
-	static_assert(sizeof(m128u32) == 16);
-	static_assert(sizeof(m128i64) == 16);
-	static_assert(sizeof(m128u64) == 16);
-	static_assert(sizeof(m128i128) == 16);
-	static_assert(sizeof(m128u128) == 16);
 }
 #endif
 
