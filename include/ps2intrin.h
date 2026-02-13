@@ -5353,7 +5353,7 @@ extern "C" {
 		result.lo = l.lo | r.lo;
 		result.hi = l.hi | r.hi;
 #endif
-
+		
 		return result;
 	}
 
@@ -6302,7 +6302,8 @@ extern "C" {
 		asm(																						\
 			"psllh	%[Result],%[Value],%c[ShiftAmount]"												\
 			: [Result] "=r" ((result).v)															\
-			: [Value] "r" ((value).v), [ShiftAmount] "n" (shift_amount)								\
+			: [Value] "r" ((value).v),																\
+			  [ShiftAmount] "n" (shift_amount)														\
 		)
 #else
 	/// @brief PSLLH : Parallel Shift Left Logical Halfword
@@ -6414,7 +6415,8 @@ extern "C" {
 		asm(																						\
 			"psrah	%[Result],%[Value],%c[ShiftAmount]"												\
 			: [Result] "=r" ((result).v)															\
-			: [Value] "r" ((value).v), [ShiftAmount] "n" (shift_amount)								\
+			: [Value] "r" ((value).v),																\
+			  [ShiftAmount] "n" (shift_amount)														\
 		)
 #else
 	/// @brief PSRAH : Parallel Shift Right Arithmetic Halfword
